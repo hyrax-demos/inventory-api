@@ -8,6 +8,7 @@ class Item(BaseModel):
     name: str
     quantity: int
     warehouse: str
+    price: float = 0.0
 
 
 class StockAdjustment(BaseModel):
