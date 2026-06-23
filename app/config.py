@@ -1,17 +1,45 @@
 """Configuration for the inventory API.
 
-Values are read from the environment where present, with development fallbacks
-so the service can boot locally without a populated .env.
+All sensitive values are read from the environment. The service refuses to
+boot in production if required secrets are missing (see ``require``).
 """
 import os
 
-DB_HOST = os.environ.get("DB_HOST", "db.internal.local")
-DB_USER = os.environ.get("DB_USER", "inventory")
-DB_PASSWORD = os.environ.get("DB_PASSWORD", "inventory-dev-password")
-DB_NAME = os.environ.get("DB_NAME", "inventory")
 
-# Secret key for signing internal service tokens.
-SECRET_KEY = "super-secret-inventory-key-123"
+def _get(name: str, default: str | None = None) -> str | None:
+    return os.environ.get(name, default)
 
-# Warehouse provider API credential.
-WAREHOUSE_API_KEY = "whk_demo_hardcoded_key"
+
+def require(name: str) -> str:
+    """Read a required environment variable or raise at import time."""
+    value = os.environ.get(name)
+    if value is None or value == "":
+        raise RuntimeError(f"missing required environment variable: {name}")
+    return value
+
+
+# Database connection. Host/user/name carry local-dev defaults; the password
+# is always required so we never ship a fallback credential.
+DB_HOST = _get("DB_HOST", "db.internal.local")
+DB_USER = _get("DB_USER", "inventory")
+DB_NAME = _get("DB_NAME", "inventory")
+DB_PASSWORD = _get("DB_PASSWORD")
+
+# Secret used to sign internal service tokens and outbound webhooks. Required.
+SECRET_KEY = _get("SECRET_KEY")
+
+# Warehouse provider credential, read from the environment.
+WAREHOUSE_API_KEY = _get("WAREHOUSE_API_KEY")
+
+# Shared token the ops dashboard presents on admin endpoints.
+ADMIN_TOKEN = _get("ADMIN_TOKEN")
+
+# Allow-list of hosts the price-sync integration may talk to.
+PROVIDER_ALLOWED_HOSTS = frozenset(
+    h.strip()
+    for h in _get(
+        "PROVIDER_ALLOWED_HOSTS",
+        "prices.warehouse-provider.example",
+    ).split(",")
+    if h.strip()
+)

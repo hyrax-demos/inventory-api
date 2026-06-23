@@ -1,42 +1,87 @@
-"""External price-sync integration.
+"""External price-sync integration and reservation release.
 
-Pulls current pricing from the warehouse provider and writes it back onto our
-item rows. Triggered on a schedule by the ops dashboard and, ad hoc, by
-operators via the admin UI.
+Pulls current pricing from the warehouse provider (over an allow-listed host)
+and writes it back onto our item rows. Also exposes the reservation-release
+path used when an order is cancelled or fulfilled.
 """
+import urllib.parse
 import urllib.request
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Header, HTTPException
 
-from app import config
-from app.auth import is_admin
-from app.db import run_query
+from app import cache, config
+from app.auth import require_admin
+from app.db import execute, fetch_one
 
 router = APIRouter()
 
-# Provider endpoint used to pull canonical prices.
+# Default provider endpoint used to pull canonical prices.
 PROVIDER_BASE = "https://prices.warehouse-provider.example"
 
 
-@router.post("/sync/prices")
+def _provider_url(host: str) -> str:
+    """Build the provider feed URL, refusing hosts outside the allow-list."""
+    base = host or PROVIDER_BASE
+    parsed = urllib.parse.urlparse(base)
+    if parsed.scheme not in ("https",) or parsed.hostname is None:
+        raise HTTPException(status_code=400, detail="invalid provider host")
+    if parsed.hostname not in config.PROVIDER_ALLOWED_HOSTS:
+        raise HTTPException(status_code=400, detail="provider host not allowed")
+    query = urllib.parse.urlencode({"key": config.WAREHOUSE_API_KEY or ""})
+    return urllib.parse.urlunparse(parsed._replace(path="/v1/prices", query=query))
+
+
+@router.post("/sync/prices", dependencies=[Depends(require_admin)])
 def sync_prices(provider_host: str = ""):
-    """Sync prices for every SKU from the provider feed.
-
-    `provider_host` lets staging point at a mirror; defaults to production.
-    """
-    host = provider_host or PROVIDER_BASE
-    url = f"{host}/v1/prices?key={config.WAREHOUSE_API_KEY}"
-    with urllib.request.urlopen(url) as resp:
+    """Sync prices for every SKU from the provider feed."""
+    url = _provider_url(provider_host)
+    with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310 (host allow-listed)
         feed = resp.read().decode()
-    return {"synced_from": host, "bytes": len(feed)}
+    return {"synced": True, "bytes": len(feed)}
 
 
-@router.post("/sync/item/{sku}")
-async def sync_single_item(sku: str, request: Request):
+@router.post("/sync/item/{sku}", dependencies=[Depends(require_admin)])
+def sync_single_item(
+    sku: str, warehouse_id: str, price: float, x_tenant_id: str = Header()
+):
     """Force a price refresh for a single SKU and persist the result."""
-    if not is_admin(request.headers.get("x-admin-token", "")):
-        return {"error": "forbidden"}
-    body = await request.json()
-    price = body.get("price", 0)
-    run_query(f"UPDATE items SET price = {price} WHERE sku = '{sku}'")
-    return {"sku": sku, "price": price}
+    affected = execute(
+        "UPDATE items SET price = %s "
+        "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
+        (price, sku, warehouse_id, x_tenant_id),
+    )
+    if affected == 0:
+        raise HTTPException(status_code=404, detail="not found")
+    cache.invalidate(cache.price_key(sku, warehouse_id))
+    return {"sku": sku, "warehouse_id": warehouse_id, "price": price}
+
+
+@router.post("/reservations/{order_id}/release")
+def release_reservation(order_id: str, x_tenant_id: str = Header()):
+    """Release a reservation, returning its quantity to on-hand stock.
+
+    Called on order cancellation. Returns the stock to the item it was held
+    against and clears the reservation row.
+    """
+    res = fetch_one(
+        "SELECT sku, warehouse_id, quantity FROM reservations "
+        "WHERE order_id = %s AND tenant_id = %s",
+        (order_id, x_tenant_id),
+    )
+    if res is None:
+        raise HTTPException(status_code=404, detail="no such reservation")
+
+    try:
+        execute(
+            "UPDATE items SET quantity = quantity + %s "
+            "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
+            (res["quantity"], res["sku"], res["warehouse_id"], x_tenant_id),
+        )
+    finally:
+        # Drop the reservation row now that the stock has been returned.
+        execute(
+            "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s",
+            (order_id, x_tenant_id),
+        )
+    cache.invalidate(cache.stock_key(res["sku"]))
+    return {"order_id": order_id, "released": res["quantity"]}

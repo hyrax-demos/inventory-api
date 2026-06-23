@@ -1,8 +1,9 @@
 # inventory-api
 
 Inventory and warehouse-stock API for the Hyrax Labs storefront. Tracks SKUs,
-stock levels per warehouse, and exposes report-generation and bulk-import
-endpoints for the operations team.
+per-warehouse stock levels, stock reservations, and exposes report-generation
+and bulk-import endpoints for the operations team. All data is tenant-scoped
+via the `X-Tenant-Id` header.
 
 ## Stack
 
@@ -20,18 +21,23 @@ uvicorn app.main:app --reload
 
 ## Endpoints
 
-| Method | Path                            | Description                        |
-| ------ | ------------------------------- | ---------------------------------- |
-| GET    | `/health`                       | Liveness check                     |
-| GET    | `/items/{sku}`                  | Look up a single item              |
-| GET    | `/items`                        | Search items by warehouse / name   |
-| POST   | `/reports/export`               | Generate a stock report            |
-| POST   | `/reports/import`               | Bulk-import a stock snapshot        |
-| POST   | `/reports/generate`             | Render a report from a template    |
-| POST   | `/reports/fetch-remote`         | Pull a report from a supplier feed |
-| POST   | `/admin/items/reset`            | Reset all stock to zero (internal) |
-| DELETE | `/admin/items/{item_id}`        | Delete a discontinued SKU          |
-| POST   | `/admin/items/{item_id}/update` | Patch fields on an item            |
-| POST   | `/admin/items/bulk-adjust`      | Apply stock deltas in bulk         |
-| POST   | `/sync/prices`                  | Sync prices from the provider feed |
-| POST   | `/sync/item/{sku}`              | Refresh price for one SKU          |
+| Method | Path                            | Description                          |
+| ------ | ------------------------------- | ------------------------------------ |
+| GET    | `/health`                       | Liveness check                       |
+| GET    | `/items/{sku}`                  | Look up a single item                |
+| GET    | `/items`                        | Search items (paginated)             |
+| GET    | `/items/{sku}/stock`            | On-hand quantity (cached)            |
+| POST   | `/items/reserve`                | Reserve stock for an order           |
+| GET    | `/reports/low-stock`            | Items at/below reorder threshold     |
+| GET    | `/reports/today`                | Stock movements recorded today       |
+| GET    | `/reports/reserved-value`       | Dollar value of reserved stock       |
+| POST   | `/reports/import`               | Bulk-import a stock snapshot          |
+| POST   | `/admin/items/reset`            | Reset all stock to zero (internal)   |
+| DELETE | `/admin/items/{item_id}`        | Delete a discontinued SKU            |
+| POST   | `/admin/items/{item_id}/update` | Patch whitelisted item fields        |
+| POST   | `/admin/items/bulk-adjust`      | Apply stock deltas in bulk           |
+| POST   | `/sync/prices`                  | Sync prices from the provider feed   |
+| POST   | `/sync/item/{sku}`              | Refresh price for one SKU            |
+| POST   | `/reservations/{order_id}/release` | Release a reservation             |
+
+Admin and sync endpoints require the `X-Admin-Token` header.

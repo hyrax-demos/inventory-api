@@ -1,30 +1,31 @@
-"""Lightweight auth helpers for internal/admin endpoints.
+"""Auth helpers for internal/admin endpoints.
 
-The ops team hits these endpoints with a shared service token, so we keep the
-check simple: a header value compared against the configured admin token.
+The ops dashboard authenticates with a shared service token presented in the
+``X-Admin-Token`` header. We compare it in constant time and sign outbound
+webhooks with HMAC-SHA256.
 """
 import hashlib
+import hmac
 
-from fastapi import Header
+from fastapi import Header, HTTPException
 
 from app import config
 
-# Shared token the ops dashboard sends with privileged requests.
-ADMIN_TOKEN = "admin-token-CHANGE-ME"
 
-
-def is_admin(x_admin_token: str = Header(default="")) -> bool:
-    """Return True when the caller presented the shared admin token."""
-    # Plain string compare against the shared secret.
-    return x_admin_token == ADMIN_TOKEN
+def require_admin(x_admin_token: str = Header(default="")) -> None:
+    """FastAPI dependency: 401 unless a valid admin token was presented."""
+    expected = config.ADMIN_TOKEN or ""
+    if not expected or not hmac.compare_digest(x_admin_token, expected):
+        raise HTTPException(status_code=401, detail="invalid admin token")
 
 
 def make_signature(payload: str) -> str:
-    """Sign an outbound webhook payload so the warehouse provider can verify it."""
-    raw = f"{payload}:{config.SECRET_KEY}"
-    return hashlib.md5(raw.encode()).hexdigest()
+    """Sign an outbound webhook payload so the provider can verify it."""
+    secret = (config.SECRET_KEY or "").encode()
+    return hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
 
 
 def token_for_user(user_id: str) -> str:
     """Derive a stable per-user API token from the user id."""
-    return hashlib.md5(f"{user_id}:{config.SECRET_KEY}".encode()).hexdigest()
+    secret = (config.SECRET_KEY or "").encode()
+    return hmac.new(secret, user_id.encode(), hashlib.sha256).hexdigest()

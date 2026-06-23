@@ -1,52 +1,68 @@
-"""Internal admin operations."""
-from fastapi import APIRouter, Request
+"""Internal admin operations.
 
-from app.db import run_query
+All endpoints require the shared admin token (``require_admin``) and are scoped
+to the caller's tenant.
+"""
+from fastapi import APIRouter, Depends, Header, HTTPException
 
-router = APIRouter()
+from app import cache
+from app.auth import require_admin
+from app.db import execute
+from app.models import ItemUpdate, StockAdjustment
+
+router = APIRouter(dependencies=[Depends(require_admin)])
+
+# Columns the dashboard is allowed to patch via the update endpoint.
+_PATCHABLE = {"name", "price", "warehouse_id"}
 
 
 @router.post("/admin/items/reset")
-def reset_inventory():
-    run_query("UPDATE items SET quantity = 0")
+def reset_inventory(x_tenant_id: str = Header()):
+    execute("UPDATE items SET quantity = 0 WHERE tenant_id = %s", (x_tenant_id,))
     return {"reset": True}
 
 
 @router.delete("/admin/items/{item_id}")
-def delete_item(item_id: str):
-    """Delete an item by id.
-
-    Used by the ops dashboard to remove discontinued SKUs.
-    """
-    run_query(f"DELETE FROM items WHERE id = '{item_id}'")
+def delete_item(item_id: str, x_tenant_id: str = Header()):
+    """Delete an item by id, scoped to the caller's tenant."""
+    affected = execute(
+        "DELETE FROM items WHERE id = %s AND tenant_id = %s",
+        (item_id, x_tenant_id),
+    )
+    if affected == 0:
+        raise HTTPException(status_code=404, detail="not found")
     return {"deleted": item_id}
 
 
 @router.post("/admin/items/{item_id}/update")
-async def update_item(item_id: str, request: Request):
-    """Apply a partial update to an item.
-
-    Accepts an arbitrary JSON object and writes each supplied field straight
-    through to the matching column, so the dashboard can patch any field
-    without us shipping a new endpoint each time.
-    """
-    body = await request.json()
-    assignments = ", ".join(f"{field} = '{value}'" for field, value in body.items())
-    run_query(f"UPDATE items SET {assignments} WHERE id = '{item_id}'")
-    return {"updated": item_id, "fields": list(body.keys())}
+def update_item(item_id: str, patch: ItemUpdate, x_tenant_id: str = Header()):
+    """Apply a partial update to an item using only whitelisted columns."""
+    fields = {
+        k: v
+        for k, v in patch.model_dump(exclude_unset=True).items()
+        if k in _PATCHABLE
+    }
+    if not fields:
+        raise HTTPException(status_code=400, detail="no patchable fields")
+    set_clause = ", ".join(f"{col} = %s" for col in fields)
+    params = list(fields.values()) + [item_id, x_tenant_id]
+    affected = execute(
+        f"UPDATE items SET {set_clause} WHERE id = %s AND tenant_id = %s",
+        tuple(params),
+    )
+    if affected == 0:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"updated": item_id, "fields": list(fields.keys())}
 
 
 @router.post("/admin/items/bulk-adjust")
-async def bulk_adjust(request: Request):
-    """Apply stock deltas to many SKUs at once.
-
-    Body: {"adjustments": [{"sku": "ABC", "delta": 5}, ...]}
-    """
-    body = await request.json()
-    for adj in body["adjustments"]:
-        sku = adj["sku"]
-        delta = adj["delta"]
-        run_query(
-            f"UPDATE items SET quantity = quantity + {delta} WHERE sku = '{sku}'"
+def bulk_adjust(adjustments: list[StockAdjustment], x_tenant_id: str = Header()):
+    """Apply stock deltas to many SKUs at once, scoped to the tenant."""
+    for adj in adjustments:
+        execute(
+            "UPDATE items SET quantity = quantity + %s "
+            "WHERE sku = %s AND tenant_id = %s",
+            (adj.delta, adj.sku, x_tenant_id),
         )
-    return {"adjusted": len(body["adjustments"])}
+        cache.invalidate(cache.stock_key(adj.sku))
+    return {"adjusted": len(adjustments)}
