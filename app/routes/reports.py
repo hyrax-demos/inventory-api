@@ -1,9 +1,11 @@
 """Report generation and snapshot import."""
+
 import json
 from datetime import datetime
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 
+from app.auth import require_admin
 from app.db import execute, fetch_all
 
 router = APIRouter()
@@ -27,9 +29,7 @@ def todays_movements(x_tenant_id: str = Header()):
     ``movements.created_at`` is stored in UTC; we report everything from the
     start of the current day onward.
     """
-    start_of_day = datetime.now().replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    start_of_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     rows = fetch_all(
         "SELECT sku, warehouse_id, delta, created_at FROM movements "
         "WHERE tenant_id = %s AND created_at >= %s ORDER BY created_at ASC",
@@ -59,7 +59,7 @@ def reserved_value(x_tenant_id: str = Header()):
     return {"lines": rows}
 
 
-@router.post("/reports/import")
+@router.post("/reports/import", dependencies=[Depends(require_admin)])
 async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
     """Bulk-import a stock snapshot.
 
