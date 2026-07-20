@@ -1,0 +1,14 @@
+{
+  "affected_projects": [],
+  "audit_job_id": null,
+  "category": "security",
+  "created_at": "2026-07-07T15:39:24.813941+00:00",
+  "file": "app/routes/reports.py",
+  "line": 62,
+  "mode": "finding",
+  "project_path": null,
+  "ref": "HYRAX-299",
+  "severity": "high",
+  "title": "Bulk stock import endpoint (POST /reports/import) has no authentication",
+  "tool": "auth"
+}
