@@ -79,8 +79,16 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
             "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
             (res["quantity"], res["sku"], res["warehouse_id"], x_tenant_id),
         )
-        # Delete the reservation only after the stock restore succeeds.
-        # Both statements share one connection so they commit or roll back together.
+        # Guard: if no item row was updated the stock restore did not happen.
+        # Raising here causes the transaction() context manager to roll back,
+        # so the DELETE below is never reached and the reservation is preserved.
+        if cur.rowcount == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="item not found; stock restore aborted, reservation kept",
+            )
+        # Delete the reservation only after the stock restore is confirmed.
+        # Both statements share one connection and commit or roll back together.
         cur.execute(
             "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s",
             (order_id, x_tenant_id),
