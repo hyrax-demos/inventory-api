@@ -4,6 +4,7 @@ Pulls current pricing from the warehouse provider (over an allow-listed host)
 and writes it back onto our item rows. Also exposes the reservation-release
 path used when an order is cancelled or fulfilled.
 """
+
 import urllib.parse
 import urllib.request
 
@@ -11,7 +12,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache, config
 from app.auth import require_admin
-from app.db import execute, fetch_one
+from app.db import execute, fetch_one, transaction
 
 router = APIRouter()
 
@@ -71,15 +72,16 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
     if res is None:
         raise HTTPException(status_code=404, detail="no such reservation")
 
-    try:
-        execute(
+    with transaction() as conn:
+        cur = conn.cursor()
+        cur.execute(
             "UPDATE items SET quantity = quantity + %s "
             "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
             (res["quantity"], res["sku"], res["warehouse_id"], x_tenant_id),
         )
-    finally:
-        # Drop the reservation row now that the stock has been returned.
-        execute(
+        # Delete the reservation only after the stock restore succeeds.
+        # Both statements share one connection so they commit or roll back together.
+        cur.execute(
             "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s",
             (order_id, x_tenant_id),
         )
