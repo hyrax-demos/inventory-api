@@ -4,6 +4,7 @@ Connections are short-lived: each helper opens, runs, and closes its own
 connection. All SQL is parameterized -- callers pass values via ``params``,
 never via string interpolation.
 """
+
 from contextlib import contextmanager
 
 import psycopg2
