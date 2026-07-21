@@ -1,4 +1,5 @@
 """Domain models for the inventory API."""
+
 from pydantic import BaseModel
 
 

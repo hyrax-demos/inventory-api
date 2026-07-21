@@ -4,6 +4,7 @@ The ops dashboard authenticates with a shared service token presented in the
 ``X-Admin-Token`` header. We compare it in constant time and sign outbound
 webhooks with HMAC-SHA256.
 """
+
 import hashlib
 import hmac
 

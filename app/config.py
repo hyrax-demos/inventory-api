@@ -3,6 +3,7 @@
 All sensitive values are read from the environment. The service refuses to
 boot in production if required secrets are missing (see ``require``).
 """
+
 import os
 
 
