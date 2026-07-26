@@ -19,6 +19,14 @@ cp .env.example .env   # fill in DB + secrets
 uvicorn app.main:app --reload
 ```
 
+## Usage
+
+Once the local development environment is set up (see above), start the API server in development mode with live-reload enabled. The server will be available at `http://localhost:8000` by default, and interactive API documentation is served at `http://localhost:8000/docs`.
+
+```bash
+uvicorn app.main:app --reload
+```
+
 ## Endpoints
 
 | Method | Path                            | Description                          |
