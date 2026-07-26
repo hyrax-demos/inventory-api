@@ -1,0 +1,14 @@
+{
+  "affected_projects": [],
+  "audit_job_id": null,
+  "category": "",
+  "created_at": "2026-07-26T18:42:15.466922+00:00",
+  "file": "",
+  "line": null,
+  "mode": "directive",
+  "project_path": null,
+  "ref": "add-a-usage-section-to-readme-md-with-a",
+  "severity": "",
+  "title": "Add a '## Usage' section to README.md with a short paragraph plus a fenced code\u2026",
+  "tool": "task"
+}

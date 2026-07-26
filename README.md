@@ -19,6 +19,14 @@ cp .env.example .env   # fill in DB + secrets
 uvicorn app.main:app --reload
 ```
 
+## Usage
+
+Once the local development environment is set up (see above), start the API server in development mode with live-reload enabled. The server will be available at `http://localhost:8000` by default, and interactive API documentation is served at `http://localhost:8000/docs`.
+
+```bash
+uvicorn app.main:app --reload
+```
+
 ## Endpoints
 
 | Method | Path                            | Description                          |
@@ -41,3 +49,33 @@ uvicorn app.main:app --reload
 | POST   | `/reservations/{order_id}/release` | Release a reservation             |
 
 Admin and sync endpoints require the `X-Admin-Token` header.
+
+## Contributing
+
+Contributions are welcome! Please follow these steps to open a pull request:
+
+1. **Fork & branch** — create a feature branch from `main` with a short,
+   descriptive name:
+   ```bash
+   git checkout -b feat/my-change
+   ```
+
+2. **Make your changes** — keep commits focused and atomic. Use the
+   conventional-commits style for commit messages:
+   ```
+   feat: add low-stock webhook notification
+   fix: correct off-by-one in pagination
+   docs: update endpoint table in README
+   ```
+
+3. **Run tests & lint** — make sure the test suite and linter pass before
+   pushing:
+   ```bash
+   pytest
+   ruff check --fix . && ruff format .
+   ```
+
+4. **Open a pull request** — push your branch and open a PR against `main`.
+   Fill in the PR description with a short summary of *what* changed and
+   *why*, reference any related issues (e.g. `Closes #42`), and ensure all
+   CI checks are green before requesting review.
