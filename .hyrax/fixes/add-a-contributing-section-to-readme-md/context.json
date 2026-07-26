@@ -1,0 +1,14 @@
+{
+  "affected_projects": [],
+  "audit_job_id": null,
+  "category": "",
+  "created_at": "2026-07-26T18:46:06.835890+00:00",
+  "file": "",
+  "line": null,
+  "mode": "directive",
+  "project_path": null,
+  "ref": "add-a-contributing-section-to-readme-md",
+  "severity": "",
+  "title": "Add a '## Contributing' section to README.md describing how to open a pull requ\u2026",
+  "tool": "task"
+}
