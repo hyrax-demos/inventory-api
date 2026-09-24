@@ -4,8 +4,10 @@ Everything runs in-process against a FakeDB: no Postgres, no network, no
 real secrets. Environment variables the app reads at import time are set
 before ``app.main`` is imported for the first time.
 """
+
 import re
 import os
+import threading
 from contextlib import contextmanager
 
 os.environ.setdefault("SECRET_KEY", "test-secret-key")
@@ -42,6 +44,9 @@ class FakeDB:
         self.reservations: list[dict] = []
         self.movements: list[dict] = []
         self._next_id = 1
+        # Models Postgres' row-level atomicity for DELETE ... RETURNING: two
+        # concurrent deletes of the same row can't both get it back.
+        self._lock = threading.Lock()
 
     # -- seeding helpers used by tests --
     def add_item(self, **kw) -> dict:
@@ -153,7 +158,11 @@ class FakeDB:
         if sql.startswith("SELECT * FROM items WHERE sku = %s AND tenant_id = %s"):
             sku, tenant_id = params
             return next(
-                (dict(r) for r in self.items if r["sku"] == sku and r["tenant_id"] == tenant_id),
+                (
+                    dict(r)
+                    for r in self.items
+                    if r["sku"] == sku and r["tenant_id"] == tenant_id
+                ),
                 None,
             )
         if sql.startswith("SELECT quantity FROM items"):
@@ -200,9 +209,11 @@ class FakeDB:
         if sql.startswith("UPDATE items SET quantity = quantity - %s"):
             delta, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", r["quantity"] - delta),
             )
 
@@ -219,7 +230,10 @@ class FakeDB:
             )
             return 1
 
-        if sql.startswith("UPDATE items SET") and "WHERE id = %s AND tenant_id = %s" in sql:
+        if (
+            sql.startswith("UPDATE items SET")
+            and "WHERE id = %s AND tenant_id = %s" in sql
+        ):
             *values, item_id, tenant_id = params
             cols = re.findall(r"(\w+) = %s", sql.split("WHERE")[0])
             return self._update_items(
@@ -230,27 +244,36 @@ class FakeDB:
         if sql.startswith("UPDATE items SET quantity = %s"):
             quantity, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", quantity),
             )
 
         if sql.startswith("UPDATE items SET price = %s"):
             price, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("price", price),
             )
 
-        if sql.startswith("UPDATE items SET quantity = quantity + %s") and "warehouse_id = %s" in sql:
+        if (
+            sql.startswith("UPDATE items SET quantity = quantity + %s")
+            and "warehouse_id = %s" in sql
+        ):
             delta, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", r["quantity"] + delta),
             )
 
@@ -282,11 +305,44 @@ class FakeDB:
             item_id, tenant_id = params
             before = len(self.items)
             self.items = [
-                r for r in self.items if not (r["id"] == item_id and r["tenant_id"] == tenant_id)
+                r
+                for r in self.items
+                if not (r["id"] == item_id and r["tenant_id"] == tenant_id)
             ]
             return before - len(self.items)
 
         raise AssertionError(f"FakeDB.execute: unrecognized query: {sql!r}")
+
+    # -- write statements with a RETURNING clause --
+    def execute_returning(self, sql: str, params: tuple = (), *, apply: bool = True):
+        """Run a ``... RETURNING`` write and return the affected rows.
+
+        With ``apply=False`` the rows that *would* be affected are returned
+        without mutating the store (used by buffered test connections that
+        only apply writes on commit).
+        """
+        params = list(params)
+        if sql.startswith("DELETE FROM reservations") and "RETURNING" in sql:
+            order_id, tenant_id = params
+            with self._lock:
+                matched = [
+                    r
+                    for r in self.reservations
+                    if r["order_id"] == order_id and r["tenant_id"] == tenant_id
+                ]
+                if apply:
+                    self.reservations = [
+                        r for r in self.reservations if not any(r is m for m in matched)
+                    ]
+            return [
+                {
+                    "sku": r["sku"],
+                    "warehouse_id": r["warehouse_id"],
+                    "quantity": r["quantity"],
+                }
+                for r in matched
+            ]
+        raise AssertionError(f"FakeDB.execute_returning: unrecognized query: {sql!r}")
 
     def _update_items(self, predicate, mutate) -> int:
         n = 0
@@ -337,6 +393,9 @@ class _FakeCursor:
     def execute(self, sql: str, params: tuple = ()) -> None:
         if sql.lstrip().upper().startswith("SELECT"):
             self._rows = self._fake_db.fetch_all(sql, params)
+        elif "RETURNING" in sql:
+            self._rows = self._fake_db.execute_returning(sql, params)
+            self._rowcount = len(self._rows)
         else:
             self._rowcount = self._fake_db.execute(sql, params)
 

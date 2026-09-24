@@ -98,12 +98,22 @@ class _BufferedCursor:
     def __init__(self, conn: _BufferedConnection):
         self._conn = conn
         self.rowcount = 0
+        self._rows: list = []
 
     def execute(self, sql, params=()):
         if sql.startswith(self._conn._fail_on):
             raise RuntimeError(f"simulated failure: {self._conn._fail_on}")
         self._conn.pending.append((sql, params))
-        self.rowcount = 1
+        if "RETURNING" in sql:
+            # Preview the rows without touching the store; the write itself
+            # is only applied on commit.
+            self._rows = self._conn._fake_db.execute_returning(sql, params, apply=False)
+            self.rowcount = len(self._rows)
+        else:
+            self.rowcount = 1
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
 
 
 def _seed_release(fake_db):
@@ -178,3 +188,78 @@ def test_release_reservation_failure_rolls_back_both(monkeypatch, fake_db, fail_
     assert len(fake_db.reservations) == 1
     assert fake_db.reservations[0]["order_id"] == "order-1"
     assert fake_db.items[0]["quantity"] == 5
+
+
+# -- idempotent release: a second release never restores stock twice --
+
+
+def test_release_reservation_twice_restores_stock_once(client, fake_db):
+    _seed_release(fake_db)
+    headers = {"X-Tenant-Id": "tenant-a"}
+
+    first = client.post("/reservations/order-1/release", headers=headers)
+    assert first.status_code == 200
+    assert first.json() == {"order_id": "order-1", "released": 3}
+
+    second = client.post("/reservations/order-1/release", headers=headers)
+    assert second.status_code == 404
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
+
+
+def test_release_unknown_reservation_is_404_and_changes_no_stock(client, fake_db):
+    _seed_release(fake_db)
+    resp = client.post(
+        "/reservations/nope/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1
+
+
+def test_release_other_tenants_reservation_is_404(client, fake_db):
+    _seed_release(fake_db)
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-b"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1
+
+
+def test_release_second_call_through_real_transaction_is_404(
+    monkeypatch, client, fake_db
+):
+    _seed_release(fake_db)
+    conns = _use_real_transaction(monkeypatch, fake_db, fail_on="<never>")
+    headers = {"X-Tenant-Id": "tenant-a"}
+
+    assert (
+        client.post("/reservations/order-1/release", headers=headers).status_code == 200
+    )
+    second = client.post("/reservations/order-1/release", headers=headers)
+    assert second.status_code == 404
+    # The not-found path rolls back its (empty) transaction, never a 500.
+    assert conns[0].committed
+    assert conns[1].rolled_back and not conns[1].committed
+    assert fake_db.items[0]["quantity"] == 8
+
+
+def test_concurrent_releases_restore_stock_once(client, fake_db):
+    # FakeDB's DELETE ... RETURNING is atomic (like a Postgres row lock), so
+    # this checks the route lets the in-transaction DELETE decide, rather
+    # than an earlier read that both threads could pass.
+    from concurrent.futures import ThreadPoolExecutor
+
+    _seed_release(fake_db)
+    headers = {"X-Tenant-Id": "tenant-a"}
+
+    def release(_):
+        return client.post("/reservations/order-1/release", headers=headers).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        codes = sorted(pool.map(release, range(8)))
+
+    assert codes == [200] + [404] * 7
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
