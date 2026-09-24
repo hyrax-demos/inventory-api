@@ -29,6 +29,25 @@ def test_low_stock_report_scoped_to_tenant(client, fake_db):
     assert [i["sku"] for i in body["items"]] == ["A"]
 
 
+def test_low_stock_report_rejects_empty_tenant_header(client, fake_db):
+    fake_db.add_item(sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="")
+    resp = client.get("/reports/low-stock", headers={"X-Tenant-Id": ""})
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": "missing tenant"}
+
+
+def test_low_stock_report_valid_tenant_header_returns_items(client, fake_db):
+    fake_db.add_item(
+        sku="A", name="a", warehouse_id="w1", quantity=3, tenant_id="tenant-a"
+    )
+    resp = client.get("/reports/low-stock", params={"threshold": 5}, headers=TENANT_A)
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "threshold": 5,
+        "items": [{"sku": "A", "name": "a", "warehouse_id": "w1", "quantity": 3}],
+    }
+
+
 def test_todays_movements_returns_recent_entries(client, fake_db):
     fake_db.add_movement(
         sku="WIDGET",
