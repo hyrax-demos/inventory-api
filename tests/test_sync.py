@@ -263,3 +263,149 @@ def test_concurrent_releases_restore_stock_once(client, fake_db):
     assert codes == [200] + [404] * 7
     assert fake_db.items[0]["quantity"] == 8
     assert fake_db.reservations == []
+
+
+# -- stock cache: a release must be visible to GET /items/{sku}/stock --
+
+from app import cache as cache_module  # noqa: E402
+
+
+def _get_stock(client, sku, warehouse_id, tenant_id):
+    return client.get(
+        f"/items/{sku}/stock",
+        params={"warehouse_id": warehouse_id},
+        headers={"X-Tenant-Id": tenant_id},
+    )
+
+
+def test_release_then_get_stock_returns_restored_quantity(client, fake_db):
+    _seed_release(fake_db)
+    headers = {"X-Tenant-Id": "tenant-a"}
+
+    warm = _get_stock(client, "WIDGET", "w1", "tenant-a")
+    assert warm.status_code == 200 and warm.json()["quantity"] == 5
+    # The GET really populated the cache, so a stale read would be possible.
+    assert cache_module.get(cache_module.stock_key("WIDGET")) == 5
+
+    assert (
+        client.post("/reservations/order-1/release", headers=headers).status_code == 200
+    )
+
+    after = _get_stock(client, "WIDGET", "w1", "tenant-a")
+    assert after.status_code == 200
+    assert after.json()["quantity"] == 8
+
+
+def test_release_through_real_transaction_then_get_stock_is_fresh(
+    monkeypatch, client, fake_db
+):
+    _seed_release(fake_db)
+    conns = _use_real_transaction(monkeypatch, fake_db, fail_on="<never>")
+    assert _get_stock(client, "WIDGET", "w1", "tenant-a").json()["quantity"] == 5
+
+    invalidated_after_commit: list[bool] = []
+    real_invalidate = cache_module.invalidate
+
+    def recording_invalidate(key):
+        invalidated_after_commit.append(bool(conns) and conns[-1].committed)
+        real_invalidate(key)
+
+    monkeypatch.setattr(cache_module, "invalidate", recording_invalidate)
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+    # Invalidation happens only once the transaction has committed.
+    assert invalidated_after_commit == [True]
+    assert _get_stock(client, "WIDGET", "w1", "tenant-a").json()["quantity"] == 8
+
+
+def test_failed_release_leaves_cache_consistent_with_db(monkeypatch, fake_db):
+    _seed_release(fake_db)
+    client = TestClient(app, raise_server_exceptions=False)
+    assert _get_stock(client, "WIDGET", "w1", "tenant-a").json()["quantity"] == 5
+
+    _use_real_transaction(
+        monkeypatch, fake_db, fail_on="UPDATE items SET quantity = quantity + %s"
+    )
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 500
+
+    # Rolled back: DB still 5, and so is whatever GET serves.
+    assert fake_db.items[0]["quantity"] == 5
+    assert _get_stock(client, "WIDGET", "w1", "tenant-a").json()["quantity"] == 5
+
+
+def test_release_in_other_tenant_does_not_corrupt_cached_stock(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=10, tenant_id="tenant-b")
+    fake_db.add_reservation(
+        order_id="order-b",
+        tenant_id="tenant-b",
+        sku="WIDGET",
+        warehouse_id="w2",
+        quantity=4,
+    )
+
+    assert _get_stock(client, "WIDGET", "w1", "tenant-a").json()["quantity"] == 5
+
+    resp = client.post(
+        "/reservations/order-b/release", headers={"X-Tenant-Id": "tenant-b"}
+    )
+    assert resp.status_code == 200
+
+    # Only tenant-b's row was restored; tenant-a's GET still reports its own
+    # quantity.
+    assert fake_db.items[0]["quantity"] == 5
+    assert fake_db.items[1]["quantity"] == 14
+    assert _get_stock(client, "WIDGET", "w1", "tenant-a").json()["quantity"] == 5
+
+
+def test_release_invalidates_the_exact_key_get_stock_reads(
+    monkeypatch, client, fake_db
+):
+    _seed_release(fake_db)
+    read_keys: list[str] = []
+    invalidated_keys: list[str] = []
+    real_get, real_invalidate = cache_module.get, cache_module.invalidate
+
+    def recording_get(key):
+        read_keys.append(key)
+        return real_get(key)
+
+    def recording_invalidate(key):
+        invalidated_keys.append(key)
+        real_invalidate(key)
+
+    monkeypatch.setattr(cache_module, "get", recording_get)
+    monkeypatch.setattr(cache_module, "invalidate", recording_invalidate)
+
+    _get_stock(client, "WIDGET", "w1", "tenant-a")
+    client.post("/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"})
+
+    assert read_keys == [cache_module.stock_key("WIDGET")]
+    assert invalidated_keys == read_keys
+
+
+def test_double_release_does_not_invalidate_again(monkeypatch, client, fake_db):
+    _seed_release(fake_db)
+    invalidated: list[str] = []
+    real_invalidate = cache_module.invalidate
+
+    def recording_invalidate(key):
+        invalidated.append(key)
+        real_invalidate(key)
+
+    monkeypatch.setattr(cache_module, "invalidate", recording_invalidate)
+    headers = {"X-Tenant-Id": "tenant-a"}
+    assert (
+        client.post("/reservations/order-1/release", headers=headers).status_code == 200
+    )
+    assert (
+        client.post("/reservations/order-1/release", headers=headers).status_code == 404
+    )
+    assert invalidated == [cache_module.stock_key("WIDGET")]
+    assert _get_stock(client, "WIDGET", "w1", "tenant-a").json()["quantity"] == 8
