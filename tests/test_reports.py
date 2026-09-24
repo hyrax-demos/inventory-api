@@ -8,8 +8,12 @@ TENANT_A = {"X-Tenant-Id": "tenant-a"}
 
 
 def test_low_stock_report_happy_path(client, fake_db):
-    fake_db.add_item(sku="A", name="a", warehouse_id="w1", quantity=2, tenant_id="tenant-a")
-    fake_db.add_item(sku="B", name="b", warehouse_id="w1", quantity=99, tenant_id="tenant-a")
+    fake_db.add_item(
+        sku="A", name="a", warehouse_id="w1", quantity=2, tenant_id="tenant-a"
+    )
+    fake_db.add_item(
+        sku="B", name="b", warehouse_id="w1", quantity=99, tenant_id="tenant-a"
+    )
     resp = client.get("/reports/low-stock", params={"threshold": 10}, headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
@@ -17,8 +21,12 @@ def test_low_stock_report_happy_path(client, fake_db):
 
 
 def test_low_stock_report_scoped_to_tenant(client, fake_db):
-    fake_db.add_item(sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
-    fake_db.add_item(sku="B", name="b", warehouse_id="w1", quantity=1, tenant_id="tenant-b")
+    fake_db.add_item(
+        sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
+    )
+    fake_db.add_item(
+        sku="B", name="b", warehouse_id="w1", quantity=1, tenant_id="tenant-b"
+    )
     resp = client.get("/reports/low-stock", headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
@@ -27,7 +35,11 @@ def test_low_stock_report_scoped_to_tenant(client, fake_db):
 
 def test_todays_movements_returns_recent_entries(client, fake_db):
     fake_db.add_movement(
-        sku="WIDGET", warehouse_id="w1", delta=-2, created_at=datetime.now(timezone.utc), tenant_id="tenant-a"
+        sku="WIDGET",
+        warehouse_id="w1",
+        delta=-2,
+        created_at=datetime.now(timezone.utc),
+        tenant_id="tenant-a",
     )
     resp = client.get("/reports/today", headers=TENANT_A)
     assert resp.status_code == 200
@@ -38,7 +50,11 @@ def test_todays_movements_returns_recent_entries(client, fake_db):
 
 def test_todays_movements_scoped_to_tenant(client, fake_db):
     fake_db.add_movement(
-        sku="WIDGET", warehouse_id="w1", delta=-2, created_at=datetime.now(timezone.utc), tenant_id="tenant-b"
+        sku="WIDGET",
+        warehouse_id="w1",
+        delta=-2,
+        created_at=datetime.now(timezone.utc),
+        tenant_id="tenant-b",
     )
     resp = client.get("/reports/today", headers=TENANT_A)
     assert resp.status_code == 200
@@ -47,8 +63,12 @@ def test_todays_movements_scoped_to_tenant(client, fake_db):
 
 
 def test_reserved_value_happy_path(client, fake_db):
-    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=100, price=2.0, tenant_id="tenant-a")
-    fake_db.add_reservation(order_id="o1", tenant_id="tenant-a", sku="WIDGET", warehouse_id="w1", quantity=3)
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=100, price=2.0, tenant_id="tenant-a"
+    )
+    fake_db.add_reservation(
+        order_id="o1", tenant_id="tenant-a", sku="WIDGET", warehouse_id="w1", quantity=3
+    )
     resp = client.get("/reports/reserved-value", headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
@@ -100,12 +120,16 @@ def test_utc_start_of_day_converts_to_utc_before_truncating():
     # 20:30 on Mar 10 at UTC-05:00 is 01:30 on Mar 11 UTC.
     minus_five = timezone(timedelta(hours=-5))
     now = datetime(2024, 3, 10, 20, 30, tzinfo=minus_five)
-    assert reports_routes.utc_start_of_day(now) == datetime(2024, 3, 11, tzinfo=timezone.utc)
+    assert reports_routes.utc_start_of_day(now) == datetime(
+        2024, 3, 11, tzinfo=timezone.utc
+    )
 
     # 03:00 on Mar 11 at UTC+09:00 is 18:00 on Mar 10 UTC.
     plus_nine = timezone(timedelta(hours=9))
     now = datetime(2024, 3, 11, 3, 0, tzinfo=plus_nine)
-    assert reports_routes.utc_start_of_day(now) == datetime(2024, 3, 10, tzinfo=timezone.utc)
+    assert reports_routes.utc_start_of_day(now) == datetime(
+        2024, 3, 10, tzinfo=timezone.utc
+    )
 
 
 def test_utc_start_of_day_rejects_naive_datetime():
@@ -144,7 +168,9 @@ def test_todays_movements_uses_utc_midnight_boundary(client, fake_db, monkeypatc
     assert [m["sku"] for m in body["movements"]] == ["AT_MIDNIGHT", "AFTER"]
 
 
-def test_todays_movements_passes_aware_utc_cutoff_to_query(client, fake_db, monkeypatch):
+def test_todays_movements_passes_aware_utc_cutoff_to_query(
+    client, fake_db, monkeypatch
+):
     now = datetime(2024, 3, 10, 18, 0, tzinfo=timezone.utc)
     monkeypatch.setattr(reports_routes, "_utc_now", lambda: now)
     captured = {}
@@ -162,9 +188,13 @@ def test_todays_movements_passes_aware_utc_cutoff_to_query(client, fake_db, monk
     assert cutoff.utcoffset() == timedelta(0)
 
 
-@pytest.mark.skipif(not hasattr(__import__("time"), "tzset"), reason="requires time.tzset")
+@pytest.mark.skipif(
+    not hasattr(__import__("time"), "tzset"), reason="requires time.tzset"
+)
 @pytest.mark.parametrize("tz", ["America/Los_Angeles", "Asia/Tokyo", "UTC"])
-def test_todays_movements_independent_of_server_timezone(client, fake_db, monkeypatch, tz):
+def test_todays_movements_independent_of_server_timezone(
+    client, fake_db, monkeypatch, tz
+):
     import time
 
     monkeypatch.setenv("TZ", tz)
