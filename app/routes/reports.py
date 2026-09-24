@@ -1,10 +1,12 @@
 """Report generation and snapshot import."""
+
 import json
 from datetime import datetime
 
 from fastapi import APIRouter, Header, HTTPException
 
-from app.db import execute, fetch_all
+from app.db import fetch_all, transaction
+from app.routes.items import _tenant
 
 router = APIRouter()
 
@@ -12,10 +14,11 @@ router = APIRouter()
 @router.get("/reports/low-stock")
 def low_stock_report(threshold: int = 10, x_tenant_id: str = Header()):
     """Items at or below the reorder threshold, scoped to the tenant."""
+    tenant_id = _tenant(x_tenant_id)
     rows = fetch_all(
         "SELECT sku, name, warehouse_id, quantity FROM items "
         "WHERE tenant_id = %s AND quantity <= %s ORDER BY quantity ASC",
-        (x_tenant_id, threshold),
+        (tenant_id, threshold),
     )
     return {"threshold": threshold, "items": rows}
 
@@ -27,9 +30,7 @@ def todays_movements(x_tenant_id: str = Header()):
     ``movements.created_at`` is stored in UTC; we report everything from the
     start of the current day onward.
     """
-    start_of_day = datetime.now().replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    start_of_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     rows = fetch_all(
         "SELECT sku, warehouse_id, delta, created_at FROM movements "
         "WHERE tenant_id = %s AND created_at >= %s ORDER BY created_at ASC",
@@ -51,6 +52,7 @@ def reserved_value(x_tenant_id: str = Header()):
         "FROM reservations r "
         "JOIN items i "
         "  ON i.sku = r.sku AND i.warehouse_id = r.warehouse_id "
+        "  AND i.tenant_id = r.tenant_id "
         "WHERE r.tenant_id = %s "
         "GROUP BY r.sku, r.warehouse_id "
         "ORDER BY reserved_value DESC",
@@ -68,7 +70,9 @@ async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
     items = payload.get("items")
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="items must be a list")
-    count = 0
+    # Validate every entry before touching the DB so a malformed entry
+    # anywhere in the list rejects the whole snapshot with nothing written.
+    updates = []
     for entry in items:
         try:
             sku = entry["sku"]
@@ -76,10 +80,16 @@ async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
             quantity = int(entry["quantity"])
         except (KeyError, TypeError, ValueError):
             raise HTTPException(status_code=400, detail="malformed snapshot entry")
-        execute(
-            "UPDATE items SET quantity = %s "
-            "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-            (quantity, sku, warehouse_id, x_tenant_id),
-        )
-        count += 1
+        updates.append((quantity, sku, warehouse_id, x_tenant_id))
+    # Apply all updates on one connection in a single transaction: it commits
+    # once at the end and rolls back if any statement fails.
+    with transaction() as conn:
+        cur = conn.cursor()
+        for params in updates:
+            cur.execute(
+                "UPDATE items SET quantity = %s "
+                "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
+                params,
+            )
+    count = len(updates)
     return {"items": count, "snapshot": json.dumps({"received": count})}
