@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache, config
 from app.auth import require_admin
-from app.db import execute, fetch_one, transaction
+from app.db import execute, transaction
 
 router = APIRouter()
 
@@ -64,28 +64,29 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
     Called on order cancellation. Returns the stock to the item it was held
     against and clears the reservation row.
     """
-    res = fetch_one(
-        "SELECT sku, warehouse_id, quantity FROM reservations "
-        "WHERE order_id = %s AND tenant_id = %s",
-        (order_id, x_tenant_id),
-    )
-    if res is None:
-        raise HTTPException(status_code=404, detail="no such reservation")
-
-    # Restore the stock and drop the reservation row atomically: if either
-    # statement fails the whole transaction rolls back, leaving the stock
-    # unchanged and the reservation row in place so nothing is lost.
+    # Claim the reservation by deleting it first, inside the same transaction
+    # as the stock restore. The quantity restored comes only from the row this
+    # transaction actually removed, never from a separate earlier read, so a
+    # repeat (or concurrent) release finds nothing to delete and cannot
+    # restore stock twice. If the restore fails, the whole transaction rolls
+    # back and the reservation row is left in place.
     with transaction() as conn:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE items SET quantity = quantity + %s "
-            "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-            (res["quantity"], res["sku"], res["warehouse_id"], x_tenant_id),
-        )
-        cur.execute(
-            "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s",
+            "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s "
+            "RETURNING sku, warehouse_id, quantity",
             (order_id, x_tenant_id),
         )
-    # Only reached once the transaction has committed.
-    cache.invalidate(cache.stock_key(res["sku"]))
-    return {"order_id": order_id, "released": res["quantity"]}
+        row = cur.fetchone()
+        if row is None:
+            # Already released, never existed, or owned by another tenant.
+            raise HTTPException(status_code=404, detail="no such reservation")
+        sku, warehouse_id, quantity = row
+        cur.execute(
+            "UPDATE items SET quantity = quantity + %s "
+            "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
+            (quantity, sku, warehouse_id, x_tenant_id),
+        )
+    # Only reached once a release has actually committed.
+    cache.invalidate(cache.stock_key(sku))
+    return {"order_id": order_id, "released": quantity}

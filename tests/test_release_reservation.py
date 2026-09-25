@@ -22,11 +22,23 @@ class _StagingCursor:
     def __init__(self, conn: "_StagingConnection"):
         self._conn = conn
         self.rowcount = 0
+        self._rows: list = []
 
     def execute(self, sql: str, params: tuple = ()) -> None:
         if self._conn.fail_on and sql.startswith(self._conn.fail_on):
             raise RuntimeError(f"simulated DB failure on: {sql}")
+        # A ``... RETURNING`` write reports the rows it would affect straight
+        # away (as Postgres does inside the open transaction), while the write
+        # itself is still only staged until commit.
+        self._rows = (
+            self._conn._fake_db.returning_rows(sql, params)
+            if "RETURNING" in sql
+            else []
+        )
         self._conn.pending.append((sql, params))
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
 
     def close(self) -> None:
         pass
@@ -159,3 +171,72 @@ def test_release_failure_propagates_exception(fake_db, staging, client):
 
     assert fake_db.items[0]["quantity"] == 5
     assert len(fake_db.reservations) == 1
+
+
+def test_release_twice_restores_stock_exactly_once(client, fake_db, staging):
+    staging()
+    _seed(fake_db)
+
+    first = client.post("/reservations/order-1/release", headers=TENANT_A)
+    assert first.status_code == 200
+    assert first.json() == {"order_id": "order-1", "released": 3}
+    assert fake_db.items[0]["quantity"] == 8
+    cache.put(cache.stock_key("WIDGET"), {"quantity": 8})
+
+    second = client.post("/reservations/order-1/release", headers=TENANT_A)
+    assert second.status_code == 404
+    assert second.json() == {"detail": "no such reservation"}
+    # Restored exactly once.
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
+    # Nothing released, so the cache is left alone.
+    assert cache.get(cache.stock_key("WIDGET")) == {"quantity": 8}
+
+
+def test_release_unknown_reservation_is_404_and_leaves_stock(client, fake_db, staging):
+    conns = staging()
+    _seed(fake_db)
+    cache.put(cache.stock_key("WIDGET"), {"quantity": 5})
+
+    resp = client.post("/reservations/no-such-order/release", headers=TENANT_A)
+
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "no such reservation"}
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1
+    # Nothing was committed and the cache was not invalidated.
+    assert len(conns) == 1 and not conns[0].committed and conns[0].closed
+    assert cache.get(cache.stock_key("WIDGET")) == {"quantity": 5}
+
+
+def test_release_other_tenants_reservation_is_404(client, fake_db, staging):
+    staging()
+    _seed(fake_db)
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-b")
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-b"}
+    )
+
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+    assert fake_db.items[1]["quantity"] == 10
+    assert fake_db.reservations == [
+        {
+            "order_id": "order-1",
+            "tenant_id": "tenant-a",
+            "sku": "WIDGET",
+            "warehouse_id": "w1",
+            "quantity": 3,
+        }
+    ]
+
+
+def test_release_twice_via_default_fake_transaction(client, fake_db):
+    _seed(fake_db)
+
+    first = client.post("/reservations/order-1/release", headers=TENANT_A)
+    second = client.post("/reservations/order-1/release", headers=TENANT_A)
+    assert first.status_code == 200
+    assert second.status_code == 404
+    assert fake_db.items[0]["quantity"] == 8
