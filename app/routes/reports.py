@@ -5,7 +5,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Header, HTTPException
 
-from app.db import execute, fetch_all
+from app.db import fetch_all, transaction
 from app.routes.items import _tenant
 
 router = APIRouter()
@@ -68,11 +68,15 @@ async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
     """Bulk-import a stock snapshot.
 
     Body: {"items": [{"sku": "ABC", "warehouse_id": "w1", "quantity": 5}, ...]}
+
+    The import is all-or-nothing: every entry is validated before anything is
+    written, and all updates run inside a single transaction, so a malformed
+    entry or a failed write leaves no entry applied.
     """
     items = payload.get("items")
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="items must be a list")
-    count = 0
+    updates = []
     for entry in items:
         try:
             sku = entry["sku"]
@@ -80,10 +84,14 @@ async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
             quantity = int(entry["quantity"])
         except (KeyError, TypeError, ValueError):
             raise HTTPException(status_code=400, detail="malformed snapshot entry")
-        execute(
-            "UPDATE items SET quantity = %s "
-            "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-            (quantity, sku, warehouse_id, x_tenant_id),
-        )
-        count += 1
+        updates.append((quantity, sku, warehouse_id, x_tenant_id))
+    with transaction() as conn:
+        cur = conn.cursor()
+        for params in updates:
+            cur.execute(
+                "UPDATE items SET quantity = %s "
+                "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
+                params,
+            )
+    count = len(updates)
     return {"items": count, "snapshot": json.dumps({"received": count})}

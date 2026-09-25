@@ -1,5 +1,7 @@
 from datetime import datetime
 
+import pytest
+
 TENANT_A = {"X-Tenant-Id": "tenant-a"}
 
 
@@ -130,3 +132,137 @@ def test_import_snapshot_rejects_malformed_entry(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 400
+
+
+# -- atomic snapshot import --------------------------------------------------
+
+
+class _StagingConnection:
+    """A fake psycopg2 connection that buffers writes until ``commit()``.
+
+    Installed underneath the real ``app.db.transaction()`` so the route's
+    transaction boundary (commit on success, rollback on exception) is what
+    decides whether the staged UPDATEs reach the FakeDB store.
+    """
+
+    def __init__(self, fake_db, fail_on_nth_write=None):
+        self._fake_db = fake_db
+        self._fail_on = fail_on_nth_write
+        self._writes = 0
+        self._staged = []
+        self.committed = False
+        self.rolled_back = False
+
+    def cursor(self, cursor_factory=None):
+        conn = self
+
+        class _Cursor:
+            rowcount = 0
+
+            def execute(self, sql, params=()):
+                conn._writes += 1
+                if conn._fail_on is not None and conn._writes == conn._fail_on:
+                    raise RuntimeError("simulated write failure")
+                conn._staged.append((sql, params))
+
+        return _Cursor()
+
+    def commit(self):
+        for sql, params in self._staged:
+            self._fake_db.execute(sql, params)
+        self._staged = []
+        self.committed = True
+
+    def rollback(self):
+        self._staged = []
+        self.rolled_back = True
+
+    def close(self):
+        pass
+
+
+def _use_staging_connection(monkeypatch, fake_db, **kw):
+    from app import db
+    from app.routes import reports as reports_routes
+
+    conn = _StagingConnection(fake_db, **kw)
+    monkeypatch.setattr(db, "get_connection", lambda: conn)
+    monkeypatch.setattr(reports_routes, "transaction", db.transaction)
+    return conn
+
+
+def _seed_three(fake_db):
+    for sku in ("A", "B", "C"):
+        fake_db.add_item(sku=sku, warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+
+
+def _quantities(fake_db):
+    return {r["sku"]: r["quantity"] for r in fake_db.items}
+
+
+def test_import_snapshot_malformed_last_entry_writes_nothing(
+    client, fake_db, monkeypatch
+):
+    _seed_three(fake_db)
+    conn = _use_staging_connection(monkeypatch, fake_db)
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": "not-a-number"},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "malformed snapshot entry"
+    assert _quantities(fake_db) == {"A": 1, "B": 1, "C": 1}
+    assert conn._writes == 0
+
+
+def test_import_snapshot_write_failure_rolls_back_all(client, fake_db, monkeypatch):
+    _seed_three(fake_db)
+    conn = _use_staging_connection(monkeypatch, fake_db, fail_on_nth_write=3)
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        client.post(
+            "/reports/import",
+            json={
+                "items": [
+                    {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                    {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                    {"sku": "C", "warehouse_id": "w1", "quantity": 30},
+                ]
+            },
+            headers=TENANT_A,
+        )
+    assert conn.rolled_back and not conn.committed
+    assert _quantities(fake_db) == {"A": 1, "B": 1, "C": 1}
+
+
+def test_import_snapshot_applies_every_entry(client, fake_db, monkeypatch):
+    _seed_three(fake_db)
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=7, tenant_id="tenant-b")
+    conn = _use_staging_connection(monkeypatch, fake_db)
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": 30},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"items": 3, "snapshot": '{"received": 3}'}
+    assert conn.committed
+    by_tenant = {(r["tenant_id"], r["sku"]): r["quantity"] for r in fake_db.items}
+    assert by_tenant == {
+        ("tenant-a", "A"): 10,
+        ("tenant-a", "B"): 20,
+        ("tenant-a", "C"): 30,
+        ("tenant-b", "A"): 7,  # other tenant untouched
+    }
