@@ -1,4 +1,5 @@
 """Report generation and snapshot import."""
+
 import json
 from datetime import datetime, timezone
 
@@ -22,7 +23,9 @@ def utc_start_of_day(now: datetime) -> datetime:
     """
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("utc_start_of_day requires a timezone-aware datetime")
-    return now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    return now.astimezone(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
 
 
 @router.get("/reports/low-stock")
