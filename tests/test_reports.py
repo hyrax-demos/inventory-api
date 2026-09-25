@@ -4,8 +4,12 @@ TENANT_A = {"X-Tenant-Id": "tenant-a"}
 
 
 def test_low_stock_report_happy_path(client, fake_db):
-    fake_db.add_item(sku="A", name="a", warehouse_id="w1", quantity=2, tenant_id="tenant-a")
-    fake_db.add_item(sku="B", name="b", warehouse_id="w1", quantity=99, tenant_id="tenant-a")
+    fake_db.add_item(
+        sku="A", name="a", warehouse_id="w1", quantity=2, tenant_id="tenant-a"
+    )
+    fake_db.add_item(
+        sku="B", name="b", warehouse_id="w1", quantity=99, tenant_id="tenant-a"
+    )
     resp = client.get("/reports/low-stock", params={"threshold": 10}, headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
@@ -13,8 +17,12 @@ def test_low_stock_report_happy_path(client, fake_db):
 
 
 def test_low_stock_report_scoped_to_tenant(client, fake_db):
-    fake_db.add_item(sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
-    fake_db.add_item(sku="B", name="b", warehouse_id="w1", quantity=1, tenant_id="tenant-b")
+    fake_db.add_item(
+        sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
+    )
+    fake_db.add_item(
+        sku="B", name="b", warehouse_id="w1", quantity=1, tenant_id="tenant-b"
+    )
     resp = client.get("/reports/low-stock", headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
@@ -23,7 +31,11 @@ def test_low_stock_report_scoped_to_tenant(client, fake_db):
 
 def test_todays_movements_returns_recent_entries(client, fake_db):
     fake_db.add_movement(
-        sku="WIDGET", warehouse_id="w1", delta=-2, created_at=datetime.now(), tenant_id="tenant-a"
+        sku="WIDGET",
+        warehouse_id="w1",
+        delta=-2,
+        created_at=datetime.now(),
+        tenant_id="tenant-a",
     )
     resp = client.get("/reports/today", headers=TENANT_A)
     assert resp.status_code == 200
@@ -34,7 +46,11 @@ def test_todays_movements_returns_recent_entries(client, fake_db):
 
 def test_todays_movements_scoped_to_tenant(client, fake_db):
     fake_db.add_movement(
-        sku="WIDGET", warehouse_id="w1", delta=-2, created_at=datetime.now(), tenant_id="tenant-b"
+        sku="WIDGET",
+        warehouse_id="w1",
+        delta=-2,
+        created_at=datetime.now(),
+        tenant_id="tenant-b",
     )
     resp = client.get("/reports/today", headers=TENANT_A)
     assert resp.status_code == 200
@@ -43,8 +59,12 @@ def test_todays_movements_scoped_to_tenant(client, fake_db):
 
 
 def test_reserved_value_happy_path(client, fake_db):
-    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=100, price=2.0, tenant_id="tenant-a")
-    fake_db.add_reservation(order_id="o1", tenant_id="tenant-a", sku="WIDGET", warehouse_id="w1", quantity=3)
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=100, price=2.0, tenant_id="tenant-a"
+    )
+    fake_db.add_reservation(
+        order_id="o1", tenant_id="tenant-a", sku="WIDGET", warehouse_id="w1", quantity=3
+    )
     resp = client.get("/reports/reserved-value", headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
@@ -52,6 +72,44 @@ def test_reserved_value_happy_path(client, fake_db):
     line = body["lines"][0]
     assert line["sku"] == "WIDGET"
     assert line["reserved_qty"] == 3
+
+
+def test_reserved_value_prices_with_same_tenant_item(client, fake_db):
+    # Tenant B's item shares the SKU and warehouse and is seeded first, so an
+    # unscoped join would price tenant A's reservation with B's price.
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=100, price=50.0, tenant_id="tenant-b"
+    )
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=100, price=2.0, tenant_id="tenant-a"
+    )
+    fake_db.add_reservation(
+        order_id="o1", tenant_id="tenant-a", sku="WIDGET", warehouse_id="w1", quantity=3
+    )
+    resp = client.get("/reports/reserved-value", headers=TENANT_A)
+    assert resp.status_code == 200
+    lines = resp.json()["lines"]
+    assert len(lines) == 1
+    assert lines[0]["reserved_qty"] == 3
+    assert lines[0]["reserved_value"] == 6.0
+
+
+def test_reserved_value_prices_tenant_b_with_its_own_item(client, fake_db):
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=100, price=2.0, tenant_id="tenant-a"
+    )
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=100, price=50.0, tenant_id="tenant-b"
+    )
+    fake_db.add_reservation(
+        order_id="o2", tenant_id="tenant-b", sku="WIDGET", warehouse_id="w1", quantity=4
+    )
+    resp = client.get("/reports/reserved-value", headers={"X-Tenant-Id": "tenant-b"})
+    assert resp.status_code == 200
+    lines = resp.json()["lines"]
+    assert len(lines) == 1
+    assert lines[0]["reserved_qty"] == 4
+    assert lines[0]["reserved_value"] == 200.0
 
 
 def test_import_snapshot_happy_path(client, fake_db):
