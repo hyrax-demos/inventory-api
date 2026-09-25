@@ -4,6 +4,8 @@ Everything runs in-process against a FakeDB: no Postgres, no network, no
 real secrets. Environment variables the app reads at import time are set
 before ``app.main`` is imported for the first time.
 """
+
+import copy
 import re
 import os
 from contextlib import contextmanager
@@ -42,6 +44,7 @@ class FakeDB:
         self.reservations: list[dict] = []
         self.movements: list[dict] = []
         self._next_id = 1
+        self.last_returning: list[dict] = []
 
     # -- seeding helpers used by tests --
     def add_item(self, **kw) -> dict:
@@ -153,7 +156,11 @@ class FakeDB:
         if sql.startswith("SELECT * FROM items WHERE sku = %s AND tenant_id = %s"):
             sku, tenant_id = params
             return next(
-                (dict(r) for r in self.items if r["sku"] == sku and r["tenant_id"] == tenant_id),
+                (
+                    dict(r)
+                    for r in self.items
+                    if r["sku"] == sku and r["tenant_id"] == tenant_id
+                ),
                 None,
             )
         if sql.startswith("SELECT quantity FROM items"):
@@ -200,9 +207,11 @@ class FakeDB:
         if sql.startswith("UPDATE items SET quantity = quantity - %s"):
             delta, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", r["quantity"] - delta),
             )
 
@@ -219,7 +228,10 @@ class FakeDB:
             )
             return 1
 
-        if sql.startswith("UPDATE items SET") and "WHERE id = %s AND tenant_id = %s" in sql:
+        if (
+            sql.startswith("UPDATE items SET")
+            and "WHERE id = %s AND tenant_id = %s" in sql
+        ):
             *values, item_id, tenant_id = params
             cols = re.findall(r"(\w+) = %s", sql.split("WHERE")[0])
             return self._update_items(
@@ -230,27 +242,36 @@ class FakeDB:
         if sql.startswith("UPDATE items SET quantity = %s"):
             quantity, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", quantity),
             )
 
         if sql.startswith("UPDATE items SET price = %s"):
             price, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("price", price),
             )
 
-        if sql.startswith("UPDATE items SET quantity = quantity + %s") and "warehouse_id = %s" in sql:
+        if (
+            sql.startswith("UPDATE items SET quantity = quantity + %s")
+            and "warehouse_id = %s" in sql
+        ):
             delta, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", r["quantity"] + delta),
             )
 
@@ -263,13 +284,15 @@ class FakeDB:
 
         if sql.startswith("DELETE FROM reservations"):
             order_id, tenant_id = params
-            before = len(self.reservations)
-            self.reservations = [
+            removed = [
                 r
                 for r in self.reservations
-                if not (r["order_id"] == order_id and r["tenant_id"] == tenant_id)
+                if r["order_id"] == order_id and r["tenant_id"] == tenant_id
             ]
-            return before - len(self.reservations)
+            self.reservations = [r for r in self.reservations if r not in removed]
+            # Rows a ``DELETE ... RETURNING`` would hand back to the cursor.
+            self.last_returning = [dict(r) for r in removed]
+            return len(removed)
 
         if sql.startswith("UPDATE items SET quantity = 0"):
             (tenant_id,) = params
@@ -282,7 +305,9 @@ class FakeDB:
             item_id, tenant_id = params
             before = len(self.items)
             self.items = [
-                r for r in self.items if not (r["id"] == item_id and r["tenant_id"] == tenant_id)
+                r
+                for r in self.items
+                if not (r["id"] == item_id and r["tenant_id"] == tenant_id)
             ]
             return before - len(self.items)
 
@@ -306,9 +331,22 @@ class FakeDB:
     # something to call. Atomicity itself is graded by a lower-layer fake
     # connection in the oracle for the tasks that need it, per the bench
     # brief's "fake at the lowest layer" rule.
+    #
+    # To let tests observe all-or-nothing behaviour at the route level, the
+    # fake snapshots its in-memory rows on entry and restores them if the
+    # ``with`` body raises, mirroring ``app.db.transaction()``'s rollback.
     @contextmanager
     def transaction(self):
-        yield _FakeConnection(self)
+        snapshot = (
+            copy.deepcopy(self.items),
+            copy.deepcopy(self.reservations),
+            copy.deepcopy(self.movements),
+        )
+        try:
+            yield _FakeConnection(self)
+        except Exception:
+            self.items, self.reservations, self.movements = snapshot
+            raise
 
 
 class _FakeConnection:
@@ -338,7 +376,16 @@ class _FakeCursor:
         if sql.lstrip().upper().startswith("SELECT"):
             self._rows = self._fake_db.fetch_all(sql, params)
         else:
+            self._fake_db.last_returning = []
             self._rowcount = self._fake_db.execute(sql, params)
+            if " RETURNING " in sql.upper():
+                cols = [
+                    c.strip()
+                    for c in sql.upper().split(" RETURNING ", 1)[1].lower().split(",")
+                ]
+                self._rows = [
+                    {c: r[c] for c in cols} for r in self._fake_db.last_returning
+                ]
 
     def fetchall(self):
         return self._rows
