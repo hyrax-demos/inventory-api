@@ -64,5 +64,7 @@ def bulk_adjust(adjustments: list[StockAdjustment], x_tenant_id: str = Header())
             "WHERE sku = %s AND tenant_id = %s",
             (adj.delta, adj.sku, x_tenant_id),
         )
-        cache.invalidate(cache.stock_key(adj.sku))
+        # The UPDATE touches this SKU in every warehouse, so drop all of the
+        # tenant's cached warehouse entries for it.
+        cache.invalidate_prefix(cache.stock_sku_prefix(tenant_id=x_tenant_id, sku=adj.sku))
     return {"adjusted": len(adjustments)}

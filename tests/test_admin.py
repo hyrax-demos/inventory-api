@@ -64,3 +64,17 @@ def test_bulk_adjust(client, fake_db):
     assert resp.json()["adjusted"] == 2
     by_sku = {r["sku"]: r["quantity"] for r in fake_db.items}
     assert by_sku == {"A": 6, "B": 0}
+
+
+def test_bulk_adjust_invalidates_cached_stock_in_every_warehouse(client, fake_db):
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    fake_db.add_item(sku="A", warehouse_id="w2", quantity=2, tenant_id="tenant-a")
+    tenant = {"X-Tenant-Id": "tenant-a"}
+
+    def stock(wh):
+        return client.get("/items/A/stock", params={"warehouse_id": wh}, headers=tenant).json()["quantity"]
+
+    assert (stock("w1"), stock("w2")) == (1, 2)
+    resp = client.post("/admin/items/bulk-adjust", json=[{"sku": "A", "delta": 5}], headers=TENANT_A)
+    assert resp.status_code == 200
+    assert (stock("w1"), stock("w2")) == (6, 7)
