@@ -2,6 +2,7 @@ import copy
 import os
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app import db as db_module
@@ -101,11 +102,19 @@ class _TxCursor:
     def __init__(self, conn):
         self._conn = conn
         self.rowcount = 0
+        self._rows = []
 
     def execute(self, sql, params=()):
         if self._conn._fail_on and sql.startswith(self._conn._fail_on):
             raise RuntimeError(f"injected failure: {self._conn._fail_on}")
-        self.rowcount = self._conn._fake_db.execute(sql, params)
+        if "RETURNING" in sql:
+            self._rows = self._conn._fake_db.execute_returning(sql, params)
+            self.rowcount = len(self._rows)
+        else:
+            self.rowcount = self._conn._fake_db.execute(sql, params)
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
 
 
 @pytest.fixture
@@ -178,3 +187,107 @@ def test_release_reservation_delete_failure_does_not_restore_stock(fake_db, real
     conn = real_tx["connections"][0]
     assert conn.rolled_back is True
     assert conn.committed is False
+
+
+# -- idempotent release ------------------------------------------------------
+#
+# The route claims the reservation (DELETE ... RETURNING) before touching
+# stock and restores only from the row it actually claimed. A repeat release
+# claims nothing, returns 404, and leaves stock alone.
+
+
+def _release(client, order_id="order-1", tenant="tenant-a"):
+    return client.post(
+        f"/reservations/{order_id}/release", headers={"X-Tenant-Id": tenant}
+    )
+
+
+def test_release_reservation_twice_restores_stock_once(fake_db, real_tx):
+    _seed(fake_db)
+    client = TestClient(app)
+    first = _release(client)
+    assert first.status_code == 200
+    assert first.json() == {"order_id": "order-1", "released": 3}
+    second = _release(client)
+    assert second.status_code == 404
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
+    # The no-op second call rolled back its (empty) transaction.
+    assert real_tx["connections"][1].committed is False
+
+
+def test_release_reservation_twice_with_default_fake(client, fake_db):
+    _seed(fake_db)
+    assert _release(client).status_code == 200
+    assert _release(client).status_code == 404
+    assert fake_db.items[0]["quantity"] == 8
+
+
+def test_release_nonexistent_reservation_leaves_stock(fake_db, real_tx):
+    _seed(fake_db)
+    client = TestClient(app)
+    resp = _release(client, order_id="does-not-exist")
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1
+
+
+def test_release_other_tenants_reservation_is_404(fake_db, real_tx):
+    _seed(fake_db)
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-b")
+    client = TestClient(app)
+    resp = _release(client, tenant="tenant-b")
+    assert resp.status_code == 404
+    assert [i["quantity"] for i in fake_db.items] == [5, 5]
+    assert len(fake_db.reservations) == 1
+
+
+def test_release_restores_claimed_quantity_not_stale_value(fake_db, real_tx):
+    # The restore uses the quantity from the row the DELETE claimed.
+    _seed(fake_db)
+    fake_db.reservations[0]["quantity"] = 4
+    client = TestClient(app)
+    resp = _release(client)
+    assert resp.json()["released"] == 4
+    assert fake_db.items[0]["quantity"] == 9
+
+
+def test_release_retry_after_failed_restore_restores_once(fake_db, real_tx):
+    _seed(fake_db)
+    real_tx["fail_on"] = "UPDATE items SET quantity = quantity + %s"
+    failing = TestClient(app, raise_server_exceptions=False)
+    assert _release(failing).status_code == 500
+    assert len(fake_db.reservations) == 1
+    real_tx["fail_on"] = None
+    client = TestClient(app)
+    assert _release(client).status_code == 200
+    assert _release(client).status_code == 404
+    assert fake_db.items[0]["quantity"] == 8
+
+
+def test_racing_releases_restore_stock_once(fake_db, real_tx, monkeypatch):
+    """Two releases interleave: the second runs to completion between the
+    first's claim and its stock restore. Only one may restore stock."""
+    _seed(fake_db)
+    original = fake_db.execute_returning
+    outcomes = []
+
+    def interleaved(sql, params=()):
+        rows = original(sql, params)
+        if not outcomes:
+            outcomes.append("racing")
+            try:
+                sync_routes.release_reservation("order-1", x_tenant_id="tenant-a")
+                outcomes.append("second-succeeded")
+            except HTTPException as exc:
+                outcomes.append(exc.status_code)
+        return rows
+
+    monkeypatch.setattr(fake_db, "execute_returning", interleaved)
+    client = TestClient(app)
+    resp = _release(client)
+    assert resp.status_code == 200
+    assert resp.json()["released"] == 3
+    assert outcomes == ["racing", 404]
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
