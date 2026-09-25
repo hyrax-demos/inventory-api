@@ -104,3 +104,60 @@ def test_release_reservation_restore_failure_keeps_reservation(fake_db, monkeypa
     assert fake_db.items[0]["quantity"] == 5
     assert len(fake_db.reservations) == 1
     assert fake_db.reservations[0]["order_id"] == "order-1"
+
+
+def _seed_release_fixture(fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+
+
+def test_release_reservation_twice_restores_stock_once(client, fake_db):
+    _seed_release_fixture(fake_db)
+    headers = {"X-Tenant-Id": "tenant-a"}
+
+    first = client.post("/reservations/order-1/release", headers=headers)
+    assert first.status_code == 200
+    assert first.json() == {"order_id": "order-1", "released": 3}
+    assert fake_db.items[0]["quantity"] == 8
+
+    second = client.post("/reservations/order-1/release", headers=headers)
+    assert second.status_code == 404
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
+
+
+def test_release_nonexistent_reservation_changes_no_stock(client, fake_db):
+    _seed_release_fixture(fake_db)
+    resp = client.post(
+        "/reservations/does-not-exist/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1
+
+
+def test_release_other_tenants_reservation_changes_no_stock(client, fake_db):
+    _seed_release_fixture(fake_db)
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-b"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1
+
+
+def test_back_to_back_releases_restore_exactly_once(client, fake_db):
+    _seed_release_fixture(fake_db)
+    headers = {"X-Tenant-Id": "tenant-a"}
+    statuses = [
+        client.post("/reservations/order-1/release", headers=headers).status_code
+        for _ in range(3)
+    ]
+    assert statuses == [200, 404, 404]
+    assert fake_db.items[0]["quantity"] == 8

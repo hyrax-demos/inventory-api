@@ -8,11 +8,12 @@ path used when an order is cancelled or fulfilled.
 import urllib.parse
 import urllib.request
 
+import psycopg2.extras
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache, config
 from app.auth import require_admin
-from app.db import execute, fetch_one, transaction
+from app.db import execute, transaction
 
 router = APIRouter()
 
@@ -63,20 +64,27 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
 
     Called on order cancellation. Returns the stock to the item it was held
     against and clears the reservation row.
-    """
-    res = fetch_one(
-        "SELECT sku, warehouse_id, quantity FROM reservations "
-        "WHERE order_id = %s AND tenant_id = %s",
-        (order_id, x_tenant_id),
-    )
-    if res is None:
-        raise HTTPException(status_code=404, detail="no such reservation")
 
-    # Restore the stock and drop the reservation row in ONE transaction: if
-    # either statement fails, both roll back and the reservation survives so
-    # its quantity is never silently lost. The error propagates to the caller.
+    Idempotency: releasing a reservation that does not exist -- never
+    created, belonging to another tenant, or already released -- returns
+    404 (matching this module's other not-found responses) and restores no
+    stock. The claim happens inside the transaction: the reservation row is
+    locked with ``SELECT ... FOR UPDATE``, so a concurrent release of the same
+    order blocks until this one commits and then finds no row.
+    """
+    # Lock the reservation, restore the stock and drop the row in ONE
+    # transaction: if any statement fails, everything rolls back and the
+    # reservation survives so its quantity is never silently lost.
     with transaction() as conn:
-        cur = conn.cursor()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT sku, warehouse_id, quantity FROM reservations "
+            "WHERE order_id = %s AND tenant_id = %s FOR UPDATE",
+            (order_id, x_tenant_id),
+        )
+        res = cur.fetchone()
+        if res is None:
+            raise HTTPException(status_code=404, detail="no such reservation")
         cur.execute(
             "UPDATE items SET quantity = quantity + %s "
             "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
@@ -86,6 +94,10 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
             "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s",
             (order_id, x_tenant_id),
         )
+        if cur.rowcount != 1:
+            # Defensive: the row lock should make this impossible. Raising
+            # rolls back the restore above so stock is never double-counted.
+            raise HTTPException(status_code=404, detail="no such reservation")
     # Only reached after a successful commit.
     cache.invalidate(cache.stock_key(res["sku"]))
     return {"order_id": order_id, "released": res["quantity"]}
