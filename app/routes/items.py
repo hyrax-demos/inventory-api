@@ -1,4 +1,5 @@
 """Inventory item lookup, search, and stock reservation."""
+
 from fastapi import APIRouter, Header, HTTPException
 
 from app import cache
@@ -65,7 +66,7 @@ def search_items(
 def get_stock(sku: str, warehouse_id: str, x_tenant_id: str = Header()):
     """Return the on-hand quantity for a SKU at a warehouse (cached)."""
     tenant_id = _tenant(x_tenant_id)
-    key = cache.stock_key(sku)
+    key = cache.stock_key(tenant_id=tenant_id, warehouse_id=warehouse_id, sku=sku)
     cached = cache.get(key)
     if cached is not None:
         return {"sku": sku, "warehouse_id": warehouse_id, "quantity": cached}
@@ -117,5 +118,7 @@ def reserve_stock(req: ReservationRequest, x_tenant_id: str = Header()):
         "VALUES (%s, %s, %s, %s, %s)",
         (req.order_id, tenant_id, req.sku, req.warehouse_id, req.quantity),
     )
-    cache.invalidate(cache.stock_key(req.sku))
+    cache.invalidate(
+        cache.stock_key(tenant_id=tenant_id, warehouse_id=req.warehouse_id, sku=req.sku)
+    )
     return {"order_id": req.order_id, "status": "reserved"}
