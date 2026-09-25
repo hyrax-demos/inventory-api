@@ -4,6 +4,7 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
+from app import cache as cache_module
 from app import db as db_module
 from app.main import app
 from app.routes import sync as sync_routes
@@ -259,3 +260,123 @@ def test_release_other_tenants_reservation_claims_nothing(client, fake_db):
     assert [i["quantity"] for i in fake_db.items] == [5, 5]
     assert len(fake_db.reservations) == 1
     assert fake_db.reservations[0]["tenant_id"] == "tenant-a"
+
+
+# -- cache correctness: release invalidates the exact key GET /stock reads --
+
+
+def _get_stock(client, tenant, warehouse, sku="WIDGET"):
+    resp = client.get(
+        f"/items/{sku}/stock",
+        params={"warehouse_id": warehouse},
+        headers={"X-Tenant-Id": tenant},
+    )
+    assert resp.status_code == 200
+    return resp.json()["quantity"]
+
+
+def test_release_then_get_stock_returns_restored_quantity(client, fake_db):
+    _seed_release(fake_db)
+    # Warm the cache with the pre-release quantity.
+    assert _get_stock(client, "tenant-a", "w1") == 5
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+    assert _get_stock(client, "tenant-a", "w1") == 8
+
+
+def test_reserve_release_roundtrip_get_stock_is_fresh(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    headers = {"X-Tenant-Id": "tenant-a"}
+    assert _get_stock(client, "tenant-a", "w1") == 10
+    body = {"sku": "WIDGET", "warehouse_id": "w1", "quantity": 4, "order_id": "o-9"}
+    assert client.post("/items/reserve", json=body, headers=headers).status_code == 200
+    assert _get_stock(client, "tenant-a", "w1") == 6
+    assert client.post("/reservations/o-9/release", headers=headers).status_code == 200
+    assert _get_stock(client, "tenant-a", "w1") == 10
+
+
+def test_release_does_not_disturb_other_tenant_or_warehouse_cache(client, fake_db):
+    _seed_release(fake_db)  # tenant-a / w1 / WIDGET: 5, reservation of 3
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=11, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=20, tenant_id="tenant-b")
+    # Warm all three entries; each must be scoped to its own tenant+warehouse.
+    assert _get_stock(client, "tenant-a", "w1") == 5
+    assert _get_stock(client, "tenant-a", "w2") == 11
+    assert _get_stock(client, "tenant-b", "w1") == 20
+    other_keys = {
+        cache_module.stock_cache_key("tenant-a", "w2", "WIDGET"),
+        cache_module.stock_cache_key("tenant-b", "w1", "WIDGET"),
+    }
+    assert other_keys <= set(cache_module._store)
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+
+    # Unrelated entries are left in place and still correct.
+    assert other_keys <= set(cache_module._store)
+    assert _get_stock(client, "tenant-a", "w1") == 8
+    assert _get_stock(client, "tenant-a", "w2") == 11
+    assert _get_stock(client, "tenant-b", "w1") == 20
+
+
+def test_get_and_release_share_stock_cache_key(client, fake_db):
+    _seed_release(fake_db)
+    _get_stock(client, "tenant-a", "w1")
+    key = cache_module.stock_cache_key("tenant-a", "w1", "WIDGET")
+    # The GET populated exactly the helper-built key ...
+    assert cache_module.get(key) == 5
+    assert (
+        client.post(
+            "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+        ).status_code
+        == 200
+    )
+    # ... and the release removed exactly that key.
+    assert key not in cache_module._store
+
+
+def test_stock_cache_key_scopes_every_component():
+    k = cache_module.stock_cache_key
+    base = k("t", "w", "s")
+    assert base == k("t", "w", "s")
+    assert len({base, k("t2", "w", "s"), k("t", "w2", "s"), k("t", "w", "s2")}) == 4
+    # A separator inside a component must not collide with another split.
+    assert k("a:b", "c", "s") != k("a", "b:c", "s")
+
+
+def test_release_invalidates_cache_only_after_commit(fake_db, real_txn, monkeypatch):
+    _, conns = real_txn
+    _seed_release(fake_db)
+    committed_at_invalidate = []
+    real_invalidate = cache_module.invalidate_stock
+
+    def spy(*args):
+        committed_at_invalidate.append(conns[-1].committed)
+        real_invalidate(*args)
+
+    monkeypatch.setattr(cache_module, "invalidate_stock", spy)
+    client = TestClient(app)
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+    assert committed_at_invalidate == [True]
+
+
+def test_failed_release_leaves_cache_warm_and_correct(fake_db, real_txn):
+    fail_on, conns = real_txn
+    _seed_release(fake_db)
+    client = TestClient(app, raise_server_exceptions=False)
+    assert _get_stock(client, "tenant-a", "w1") == 5
+    fail_on("UPDATE items SET quantity = quantity + %s")
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code >= 500
+    assert conns[-1].rolled_back
+    # Rolled back: stock unchanged, and the cached value is still right.
+    assert _get_stock(client, "tenant-a", "w1") == 5

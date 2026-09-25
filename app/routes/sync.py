@@ -94,5 +94,11 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
             "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
             (res["quantity"], res["sku"], res["warehouse_id"], x_tenant_id),
         )
-    cache.invalidate(cache.stock_key(res["sku"]))
+    # Reached only once the transaction above has committed (a rollback or
+    # the 404 no-op raises out of the ``with``), so a concurrent GET can't
+    # re-cache the pre-commit quantity after this runs. The key is built by
+    # the same helper GET /items/{sku}/stock reads, from the reservation row
+    # that was actually claimed (its tenant is x_tenant_id: the claiming
+    # DELETE is filtered on it).
+    cache.invalidate_stock(x_tenant_id, res["warehouse_id"], res["sku"])
     return {"order_id": order_id, "released": res["quantity"]}
