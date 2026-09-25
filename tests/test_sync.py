@@ -161,3 +161,62 @@ def test_back_to_back_releases_restore_exactly_once(client, fake_db):
     ]
     assert statuses == [200, 404, 404]
     assert fake_db.items[0]["quantity"] == 8
+
+
+def test_release_reservation_invalidates_cached_stock(client, fake_db):
+    """A GET that cached the reduced quantity must see the restored one."""
+    from app import cache
+
+    _seed_release_fixture(fake_db)
+    headers = {"X-Tenant-Id": "tenant-a"}
+    params = {"warehouse_id": "w1"}
+
+    before = client.get("/items/WIDGET/stock", params=params, headers=headers)
+    assert before.status_code == 200
+    assert before.json()["quantity"] == 5
+    # The GET populated exactly the key it reads.
+    assert cache.get(cache.stock_key("WIDGET")) == 5
+
+    released = client.post("/reservations/order-1/release", headers=headers)
+    assert released.status_code == 200
+    assert released.json() == {"order_id": "order-1", "released": 3}
+
+    after = client.get("/items/WIDGET/stock", params=params, headers=headers)
+    assert after.status_code == 200
+    assert after.json() == {"sku": "WIDGET", "warehouse_id": "w1", "quantity": 8}
+
+
+def test_release_reservation_leaves_other_skus_cache_alone(client, fake_db):
+    from app import cache
+
+    _seed_release_fixture(fake_db)
+    cache.put(cache.stock_key("GADGET"), 11)
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+    assert cache.get(cache.stock_key("GADGET")) == 11
+
+
+def test_second_release_does_not_change_served_stock(client, fake_db):
+    _seed_release_fixture(fake_db)
+    headers = {"X-Tenant-Id": "tenant-a"}
+    params = {"warehouse_id": "w1"}
+
+    assert (
+        client.post("/reservations/order-1/release", headers=headers).status_code == 200
+    )
+    assert (
+        client.get("/items/WIDGET/stock", params=params, headers=headers).json()[
+            "quantity"
+        ]
+        == 8
+    )
+
+    assert (
+        client.post("/reservations/order-1/release", headers=headers).status_code == 404
+    )
+    after = client.get("/items/WIDGET/stock", params=params, headers=headers)
+    assert after.json()["quantity"] == 8
+    assert fake_db.items[0]["quantity"] == 8
