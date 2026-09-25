@@ -10,7 +10,9 @@ def test_sync_prices_requires_admin_token(client, fake_db):
 
 
 def test_sync_single_item_happy_path(client, fake_db):
-    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=1, price=1.0, tenant_id="tenant-a")
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=1, price=1.0, tenant_id="tenant-a"
+    )
     resp = client.post(
         "/sync/item/WIDGET",
         params={"warehouse_id": "w1", "price": 9.99},
@@ -31,13 +33,223 @@ def test_sync_single_item_not_found(client, fake_db):
 
 def test_release_reservation_happy_path(client, fake_db):
     fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
-    fake_db.add_reservation(order_id="order-1", tenant_id="tenant-a", sku="WIDGET", warehouse_id="w1", quantity=3)
-    resp = client.post("/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"})
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
     assert resp.status_code == 200
     assert resp.json()["released"] == 3
     assert fake_db.items[0]["quantity"] == 8
 
 
 def test_release_reservation_not_found(client, fake_db):
-    resp = client.post("/reservations/does-not-exist/release", headers={"X-Tenant-Id": "tenant-a"})
+    resp = client.post(
+        "/reservations/does-not-exist/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
     assert resp.status_code == 404
+
+
+def _seed_reservation(fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+
+
+def _fail_on(fake_db, monkeypatch, prefix):
+    real_execute = fake_db.execute
+
+    def failing_execute(sql, params=()):
+        if sql.startswith(prefix):
+            raise RuntimeError("simulated DB failure")
+        return real_execute(sql, params)
+
+    monkeypatch.setattr(fake_db, "execute", failing_execute)
+
+
+def test_release_reservation_removes_row_and_restores_stock(client, fake_db):
+    _seed_reservation(fake_db)
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"order_id": "order-1", "released": 3}
+    assert fake_db.reservations == []
+    assert fake_db.items[0]["quantity"] == 8
+
+
+def test_release_reservation_stock_update_failure_keeps_reservation(
+    fake_db, monkeypatch
+):
+    from fastapi.testclient import TestClient
+
+    from app import cache
+    from app.main import app
+
+    _seed_reservation(fake_db)
+    cache.put(cache.stock_key("WIDGET"), {"quantity": 5})
+    _fail_on(fake_db, monkeypatch, "UPDATE items SET quantity = quantity + %s")
+
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+
+    assert resp.status_code == 500
+    assert len(fake_db.reservations) == 1
+    assert fake_db.reservations[0]["order_id"] == "order-1"
+    assert fake_db.items[0]["quantity"] == 5
+    # Rolled back: the cache must not have been invalidated.
+    assert cache.get(cache.stock_key("WIDGET")) == {"quantity": 5}
+
+
+def test_release_reservation_delete_failure_rolls_back_stock(fake_db, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    _seed_reservation(fake_db)
+    _fail_on(fake_db, monkeypatch, "DELETE FROM reservations")
+
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+
+    assert resp.status_code == 500
+    assert len(fake_db.reservations) == 1
+    assert fake_db.items[0]["quantity"] == 5
+
+
+def test_release_reservation_twice_restores_stock_once(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    reserve = client.post(
+        "/items/reserve",
+        json={"sku": "WIDGET", "warehouse_id": "w1", "quantity": 4, "order_id": "o-2"},
+        headers={"X-Tenant-Id": "tenant-a"},
+    )
+    assert reserve.status_code == 200
+    assert fake_db.items[0]["quantity"] == 6
+
+    first = client.post(
+        "/reservations/o-2/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert first.status_code == 200
+    assert first.json() == {"order_id": "o-2", "released": 4}
+    assert fake_db.items[0]["quantity"] == 10
+
+    second = client.post(
+        "/reservations/o-2/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert second.status_code == 404
+    # Stock went back up by the reserved quantity exactly once.
+    assert fake_db.items[0]["quantity"] == 10
+    assert fake_db.reservations == []
+
+
+def test_release_nonexistent_reservation_leaves_stock_unchanged(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    resp = client.post(
+        "/reservations/never-existed/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+
+
+def test_release_other_tenants_reservation_is_404(client, fake_db):
+    _seed_reservation(fake_db)
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-b"}
+    )
+    assert resp.status_code == 404
+    assert len(fake_db.reservations) == 1
+    assert fake_db.items[0]["quantity"] == 5
+
+
+def test_release_reservation_invalidates_stock_cache_read_by_get_stock(client, fake_db):
+    # Uses the real in-process cache (cleared per test by conftest), so any
+    # mismatch between the key get_stock reads and the key release
+    # invalidates would surface as a stale quantity here.
+    from app import cache
+
+    tenant = {"X-Tenant-Id": "tenant-a"}
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="GADGET", warehouse_id="w1", quantity=7, tenant_id="tenant-a")
+
+    reserve = client.post(
+        "/items/reserve",
+        json={"sku": "WIDGET", "warehouse_id": "w1", "quantity": 4, "order_id": "o-9"},
+        headers=tenant,
+    )
+    assert reserve.status_code == 200
+
+    # Populate the cache with the reduced quantity.
+    before = client.get(
+        "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=tenant
+    )
+    assert before.status_code == 200
+    assert before.json()["quantity"] == 6
+    assert cache.get(cache.stock_key("WIDGET")) == 6
+
+    # An unrelated SKU's cached entry must survive the release.
+    other = client.get(
+        "/items/GADGET/stock", params={"warehouse_id": "w1"}, headers=tenant
+    )
+    assert other.json()["quantity"] == 7
+
+    released = client.post("/reservations/o-9/release", headers=tenant)
+    assert released.status_code == 200
+    assert released.json() == {"order_id": "o-9", "released": 4}
+
+    after = client.get(
+        "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=tenant
+    )
+    assert after.status_code == 200
+    assert after.json()["quantity"] == 10
+    assert cache.get(cache.stock_key("GADGET")) == 7
+
+
+def test_release_reservation_404_does_not_invalidate_stock_cache(client, fake_db):
+    from app import cache
+
+    tenant = {"X-Tenant-Id": "tenant-a"}
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    resp = client.get(
+        "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=tenant
+    )
+    assert resp.json()["quantity"] == 5
+
+    missing = client.post("/reservations/never-existed/release", headers=tenant)
+    assert missing.status_code == 404
+    # No reservation was released, so the cached entry is left alone.
+    assert cache.get(cache.stock_key("WIDGET")) == 5
+
+
+def test_release_other_tenants_reservation_does_not_invalidate_stock_cache(
+    client, fake_db
+):
+    from app import cache
+
+    _seed_reservation(fake_db)
+    resp = client.get(
+        "/items/WIDGET/stock",
+        params={"warehouse_id": "w1"},
+        headers={"X-Tenant-Id": "tenant-a"},
+    )
+    assert resp.json()["quantity"] == 5
+
+    denied = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-b"}
+    )
+    assert denied.status_code == 404
+    assert cache.get(cache.stock_key("WIDGET")) == 5
