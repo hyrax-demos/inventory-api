@@ -5,6 +5,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from app import cache
 from app import db as db_module
 from app.main import app
 from app.routes import sync as sync_routes
@@ -291,3 +292,82 @@ def test_racing_releases_restore_stock_once(fake_db, real_tx, monkeypatch):
     assert outcomes == ["racing", 404]
     assert fake_db.items[0]["quantity"] == 8
     assert fake_db.reservations == []
+
+
+# -- stock cache invalidation on release -------------------------------------
+#
+# GET /items/{sku}/stock reads through ``cache.stock_key``; release must drop
+# exactly that key, and only once its transaction has committed.
+
+
+def _get_stock(client, sku="WIDGET", warehouse_id="w1", tenant="tenant-a"):
+    return client.get(
+        f"/items/{sku}/stock",
+        params={"warehouse_id": warehouse_id},
+        headers={"X-Tenant-Id": tenant},
+    )
+
+
+def test_release_then_get_stock_returns_restored_quantity(fake_db, real_tx):
+    _seed(fake_db)
+    client = TestClient(app)
+    warm = _get_stock(client)
+    assert warm.json()["quantity"] == 5
+    assert cache.get(cache.stock_key("WIDGET")) == 5
+
+    assert _release(client).status_code == 200
+
+    fresh = _get_stock(client)
+    assert fresh.status_code == 200
+    assert fresh.json() == {"sku": "WIDGET", "warehouse_id": "w1", "quantity": 8}
+
+
+def test_release_then_get_stock_with_default_fake(client, fake_db):
+    _seed(fake_db)
+    assert _get_stock(client).json()["quantity"] == 5
+    assert _release(client).status_code == 200
+    assert _get_stock(client).json()["quantity"] == 8
+
+
+def test_failed_release_does_not_invalidate_stock_cache(fake_db, real_tx):
+    _seed(fake_db)
+    client = TestClient(app, raise_server_exceptions=False)
+    assert _get_stock(client).json()["quantity"] == 5
+    real_tx["fail_on"] = "UPDATE items SET quantity = quantity + %s"
+    assert _release(client).status_code == 500
+    # Rolled back: stock unchanged and the cached value is still valid.
+    assert cache.get(cache.stock_key("WIDGET")) == 5
+    assert _get_stock(client).json()["quantity"] == 5
+
+
+def test_noop_release_does_not_invalidate_stock_cache(fake_db, real_tx):
+    _seed(fake_db)
+    client = TestClient(app)
+    assert _get_stock(client).json()["quantity"] == 5
+    assert _release(client, order_id="does-not-exist").status_code == 404
+    assert cache.get(cache.stock_key("WIDGET")) == 5
+
+
+def test_release_leaves_other_rows_and_cache_entries_intact(fake_db, real_tx):
+    _seed(fake_db)
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=11, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=7, tenant_id="tenant-b")
+    fake_db.add_item(sku="GADGET", warehouse_id="w1", quantity=2, tenant_id="tenant-a")
+    client = TestClient(app)
+    assert _get_stock(client, sku="GADGET").json()["quantity"] == 2
+
+    assert _release(client).status_code == 200
+
+    # Only the reserved tenant/warehouse/sku row was restored.
+    quantities = {
+        (i["tenant_id"], i["warehouse_id"], i["sku"]): i["quantity"]
+        for i in fake_db.items
+    }
+    assert quantities == {
+        ("tenant-a", "w1", "WIDGET"): 8,
+        ("tenant-a", "w2", "WIDGET"): 11,
+        ("tenant-b", "w1", "WIDGET"): 7,
+        ("tenant-a", "w1", "GADGET"): 2,
+    }
+    # An unrelated SKU's cached stock is not cleared.
+    assert cache.get(cache.stock_key("GADGET")) == 2

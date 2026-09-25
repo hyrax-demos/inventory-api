@@ -94,5 +94,9 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
             "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
             (quantity, sku, warehouse_id, x_tenant_id),
         )
+    # Reached only after transaction() committed: a rollback or the 404
+    # no-op path raises out of the block above and never invalidates. Use
+    # the same key builder GET /items/{sku}/stock reads through
+    # (cache.stock_key), fed from the claimed row, so the keys cannot drift.
     cache.invalidate(cache.stock_key(sku))
     return {"order_id": order_id, "released": quantity}
