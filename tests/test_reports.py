@@ -180,3 +180,154 @@ def test_import_snapshot_rejects_malformed_entry(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 400
+
+
+def _seed_import_items(fake_db):
+    for sku in ("A", "B", "C"):
+        fake_db.add_item(sku=sku, warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+
+
+def _quantities(fake_db):
+    return {r["sku"]: r["quantity"] for r in fake_db.items}
+
+
+def test_import_snapshot_malformed_last_entry_writes_nothing(client, fake_db):
+    _seed_import_items(fake_db)
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": "not-a-number"},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": "malformed snapshot entry"}
+    assert _quantities(fake_db) == {"A": 1, "B": 1, "C": 1}
+
+
+def test_import_snapshot_write_failure_rolls_back_all_entries(
+    client, fake_db, monkeypatch
+):
+    import copy
+    from contextlib import contextmanager
+
+    from app.routes import reports as reports_routes
+
+    _seed_import_items(fake_db)
+
+    class _FailingCursor:
+        """Applies writes to the fake store, raising on the Nth statement."""
+
+        def __init__(self, fail_on: int):
+            self.calls = 0
+            self.fail_on = fail_on
+
+        def execute(self, sql, params=()):
+            self.calls += 1
+            if self.calls == self.fail_on:
+                raise RuntimeError("simulated write failure")
+            fake_db.execute(sql, params)
+
+    class _Conn:
+        def cursor(self, cursor_factory=None):
+            return _FailingCursor(fail_on=2)
+
+    @contextmanager
+    def rollback_transaction():
+        # Mirrors app.db.transaction(): commit on success, roll back on error.
+        snapshot = copy.deepcopy(fake_db.items)
+        try:
+            yield _Conn()
+        except Exception:
+            fake_db.items = snapshot
+            raise
+
+    monkeypatch.setattr(reports_routes, "transaction", rollback_transaction)
+
+    no_raise_client = type(client)(client.app, raise_server_exceptions=False)
+    resp = no_raise_client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": 30},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 500
+    assert _quantities(fake_db) == {"A": 1, "B": 1, "C": 1}
+
+
+def test_import_snapshot_uses_single_transaction(client, fake_db, monkeypatch):
+    from contextlib import contextmanager
+
+    from app.routes import reports as reports_routes
+
+    _seed_import_items(fake_db)
+    opened = []
+    real_transaction = fake_db.transaction
+
+    @contextmanager
+    def counting_transaction():
+        opened.append(1)
+        with real_transaction() as conn:
+            yield conn
+
+    monkeypatch.setattr(reports_routes, "transaction", counting_transaction)
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+    assert len(opened) == 1
+
+
+def test_import_snapshot_valid_list_applies_every_entry(client, fake_db):
+    _seed_import_items(fake_db)
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=7, tenant_id="tenant-b")
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": 30},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["items"] == 3
+    assert body["snapshot"] == '{"received": 3}'
+    tenant_a = {
+        r["sku"]: r["quantity"] for r in fake_db.items if r["tenant_id"] == "tenant-a"
+    }
+    assert tenant_a == {"A": 10, "B": 20, "C": 30}
+    # Tenant scoping on the writes is preserved.
+    other = next(r for r in fake_db.items if r["tenant_id"] == "tenant-b")
+    assert other["quantity"] == 7
+
+
+def test_import_snapshot_rejects_negative_or_non_dict_entries(client, fake_db):
+    _seed_import_items(fake_db)
+    for bad in ({"sku": "B", "warehouse_id": "w1", "quantity": -1}, "oops"):
+        resp = client.post(
+            "/reports/import",
+            json={"items": [{"sku": "A", "warehouse_id": "w1", "quantity": 10}, bad]},
+            headers=TENANT_A,
+        )
+        assert resp.status_code == 400
+    assert _quantities(fake_db) == {"A": 1, "B": 1, "C": 1}

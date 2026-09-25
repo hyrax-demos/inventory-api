@@ -5,7 +5,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Header, HTTPException
 
-from app.db import execute, fetch_all
+from app.db import fetch_all, transaction
 from app.routes.items import _tenant
 
 router = APIRouter()
@@ -61,6 +61,32 @@ def reserved_value(x_tenant_id: str = Header()):
     return {"lines": rows}
 
 
+def _parse_snapshot_entry(entry) -> tuple[str, str, int]:
+    """Validate one snapshot entry; raise 400 if it is malformed."""
+    malformed = HTTPException(status_code=400, detail="malformed snapshot entry")
+    if not isinstance(entry, dict):
+        raise malformed
+    try:
+        sku = entry["sku"]
+        warehouse_id = entry["warehouse_id"]
+        raw_quantity = entry["quantity"]
+    except KeyError:
+        raise malformed
+    if not isinstance(sku, str) or not sku:
+        raise malformed
+    if not isinstance(warehouse_id, str) or not warehouse_id:
+        raise malformed
+    if isinstance(raw_quantity, bool):
+        raise malformed
+    try:
+        quantity = int(raw_quantity)
+    except (TypeError, ValueError):
+        raise malformed
+    if quantity < 0:
+        raise malformed
+    return sku, warehouse_id, quantity
+
+
 @router.post("/reports/import")
 async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
     """Bulk-import a stock snapshot.
@@ -70,18 +96,18 @@ async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
     items = payload.get("items")
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="items must be a list")
-    count = 0
-    for entry in items:
-        try:
-            sku = entry["sku"]
-            warehouse_id = entry["warehouse_id"]
-            quantity = int(entry["quantity"])
-        except (KeyError, TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="malformed snapshot entry")
-        execute(
-            "UPDATE items SET quantity = %s "
-            "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-            (quantity, sku, warehouse_id, x_tenant_id),
-        )
-        count += 1
+    # Validate every entry before touching the DB so a malformed entry
+    # anywhere in the list means nothing is written.
+    updates = [_parse_snapshot_entry(entry) for entry in items]
+    # Apply every update on one connection in one transaction: a failure
+    # on any statement rolls back all of them.
+    with transaction() as conn:
+        cur = conn.cursor()
+        for sku, warehouse_id, quantity in updates:
+            cur.execute(
+                "UPDATE items SET quantity = %s "
+                "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
+                (quantity, sku, warehouse_id, x_tenant_id),
+            )
+    count = len(updates)
     return {"items": count, "snapshot": json.dumps({"received": count})}
