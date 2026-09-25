@@ -1,4 +1,5 @@
 """Report generation and snapshot import."""
+
 import json
 from datetime import datetime
 
@@ -27,9 +28,7 @@ def todays_movements(x_tenant_id: str = Header()):
     ``movements.created_at`` is stored in UTC; we report everything from the
     start of the current day onward.
     """
-    start_of_day = datetime.now().replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    start_of_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     rows = fetch_all(
         "SELECT sku, warehouse_id, delta, created_at FROM movements "
         "WHERE tenant_id = %s AND created_at >= %s ORDER BY created_at ASC",
@@ -43,6 +42,8 @@ def reserved_value(x_tenant_id: str = Header()):
     """Total dollar value of stock currently reserved, by SKU.
 
     Joins open reservations to their item rows to price each reservation.
+    The join is tenant-scoped so a reservation is only ever priced using an
+    item row belonging to the same tenant.
     """
     rows = fetch_all(
         "SELECT r.sku, r.warehouse_id, "
@@ -51,6 +52,7 @@ def reserved_value(x_tenant_id: str = Header()):
         "FROM reservations r "
         "JOIN items i "
         "  ON i.sku = r.sku AND i.warehouse_id = r.warehouse_id "
+        "  AND i.tenant_id = r.tenant_id "
         "WHERE r.tenant_id = %s "
         "GROUP BY r.sku, r.warehouse_id "
         "ORDER BY reserved_value DESC",
