@@ -1,4 +1,5 @@
 """Report generation and snapshot import."""
+
 import json
 from datetime import datetime, timezone
 
