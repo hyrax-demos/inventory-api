@@ -240,3 +240,101 @@ def test_release_twice_via_default_fake_transaction(client, fake_db):
     assert first.status_code == 200
     assert second.status_code == 404
     assert fake_db.items[0]["quantity"] == 8
+
+
+# -- Stock cache correctness: release vs. GET /items/{sku}/stock --
+
+
+def _get_stock(client, headers, sku="WIDGET", warehouse_id="w1"):
+    resp = client.get(
+        f"/items/{sku}/stock", params={"warehouse_id": warehouse_id}, headers=headers
+    )
+    assert resp.status_code == 200
+    return resp.json()["quantity"]
+
+
+def test_release_refreshes_cached_stock_read(client, fake_db, staging):
+    staging()
+    _seed(fake_db)
+
+    # Prime the real cache through the reader.
+    assert _get_stock(client, TENANT_A) == 5
+    assert cache.get(cache.stock_cache_key("tenant-a", "w1", "WIDGET")) == 5
+
+    resp = client.post("/reservations/order-1/release", headers=TENANT_A)
+    assert resp.status_code == 200
+
+    # The exact key the reader uses was dropped, so the next read is fresh.
+    assert cache.get(cache.stock_cache_key("tenant-a", "w1", "WIDGET")) is None
+    assert _get_stock(client, TENANT_A) == 8
+
+
+def test_release_refreshes_cached_stock_read_default_fake(client, fake_db):
+    _seed(fake_db)
+    assert _get_stock(client, TENANT_A) == 5
+
+    assert (
+        client.post("/reservations/order-1/release", headers=TENANT_A).status_code
+        == 200
+    )
+
+    assert _get_stock(client, TENANT_A) == 8
+
+
+def test_release_does_not_disturb_other_tenants_or_warehouses(client, fake_db, staging):
+    staging()
+    _seed(fake_db)
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=20, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=50, tenant_id="tenant-b")
+    tenant_b = {"X-Tenant-Id": "tenant-b"}
+
+    # Each tenant + warehouse sees its own quantity, not a shared cache entry.
+    assert _get_stock(client, TENANT_A, warehouse_id="w1") == 5
+    assert _get_stock(client, TENANT_A, warehouse_id="w2") == 20
+    assert _get_stock(client, tenant_b, warehouse_id="w1") == 50
+
+    resp = client.post("/reservations/order-1/release", headers=TENANT_A)
+    assert resp.status_code == 200
+
+    # Unrelated entries stay cached and still hold correct values.
+    assert cache.get(cache.stock_cache_key("tenant-a", "w2", "WIDGET")) == 20
+    assert cache.get(cache.stock_cache_key("tenant-b", "w1", "WIDGET")) == 50
+    assert _get_stock(client, TENANT_A, warehouse_id="w1") == 8
+    assert _get_stock(client, TENANT_A, warehouse_id="w2") == 20
+    assert _get_stock(client, tenant_b, warehouse_id="w1") == 50
+
+
+def test_release_invalidates_using_reservation_row_warehouse(client, fake_db, staging):
+    """The invalidated key comes from the released row, not from request input."""
+    staging()
+    fake_db.add_item(sku="GADGET", warehouse_id="w9", quantity=1, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-9",
+        tenant_id="tenant-a",
+        sku="GADGET",
+        warehouse_id="w9",
+        quantity=4,
+    )
+    assert _get_stock(client, TENANT_A, sku="GADGET", warehouse_id="w9") == 1
+
+    resp = client.post(
+        "/reservations/order-9/release",
+        params={"warehouse_id": "w1", "sku": "WIDGET"},
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+
+    assert _get_stock(client, TENANT_A, sku="GADGET", warehouse_id="w9") == 5
+
+
+def test_failed_release_keeps_cached_stock(fake_db, staging):
+    staging(fail_on="UPDATE items SET quantity = quantity + %s")
+    _seed(fake_db)
+    client = TestClient(app, raise_server_exceptions=False)
+    assert _get_stock(client, TENANT_A) == 5
+
+    resp = client.post("/reservations/order-1/release", headers=TENANT_A)
+    assert resp.status_code == 500
+
+    assert cache.get(cache.stock_cache_key("tenant-a", "w1", "WIDGET")) == 5
+    assert _get_stock(client, TENANT_A) == 5
