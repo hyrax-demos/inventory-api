@@ -126,3 +126,53 @@ def test_reserve_stock_missing_item(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 404
+
+
+def test_get_stock_cache_is_scoped_by_warehouse(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=99, tenant_id="tenant-a")
+    r1 = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    r2 = client.get("/items/WIDGET/stock", params={"warehouse_id": "w2"}, headers=TENANT_A)
+    assert r1.json()["quantity"] == 10
+    assert r2.json()["quantity"] == 99
+
+
+def test_get_stock_cache_is_scoped_by_tenant(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=3, tenant_id="tenant-b")
+    ra = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    rb = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_B)
+    assert ra.json()["quantity"] == 10
+    assert rb.json()["quantity"] == 3
+
+
+def test_get_stock_cache_miss_for_other_tenant_is_not_served_from_cache(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    ra = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    assert ra.status_code == 200
+    rb = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_B)
+    assert rb.status_code == 404
+
+
+def test_reserve_stock_is_reflected_on_next_stock_read(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=20, tenant_id="tenant-a")
+    params_w1 = {"warehouse_id": "w1"}
+    params_w2 = {"warehouse_id": "w2"}
+    assert client.get("/items/WIDGET/stock", params=params_w1, headers=TENANT_A).json()["quantity"] == 10
+    assert client.get("/items/WIDGET/stock", params=params_w2, headers=TENANT_A).json()["quantity"] == 20
+    resp = client.post(
+        "/items/reserve",
+        json={"sku": "WIDGET", "warehouse_id": "w1", "quantity": 4, "order_id": "order-1"},
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+    assert client.get("/items/WIDGET/stock", params=params_w1, headers=TENANT_A).json()["quantity"] == 6
+    assert client.get("/items/WIDGET/stock", params=params_w2, headers=TENANT_A).json()["quantity"] == 20
+
+
+def test_stock_key_components_cannot_collide():
+    from app import cache
+
+    assert cache.stock_key("t", "w1", "a:b") != cache.stock_key("t", "b:w1", "a")
+    assert cache.stock_key("t:x", "w", "s") != cache.stock_key("t", "w", "x:s")
