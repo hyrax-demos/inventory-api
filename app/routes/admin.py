@@ -3,6 +3,7 @@
 All endpoints require the shared admin token (``require_admin``) and are scoped
 to the caller's tenant.
 """
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache
@@ -38,9 +39,7 @@ def delete_item(item_id: str, x_tenant_id: str = Header()):
 def update_item(item_id: str, patch: ItemUpdate, x_tenant_id: str = Header()):
     """Apply a partial update to an item using only whitelisted columns."""
     fields = {
-        k: v
-        for k, v in patch.model_dump(exclude_unset=True).items()
-        if k in _PATCHABLE
+        k: v for k, v in patch.model_dump(exclude_unset=True).items() if k in _PATCHABLE
     }
     if not fields:
         raise HTTPException(status_code=400, detail="no patchable fields")
