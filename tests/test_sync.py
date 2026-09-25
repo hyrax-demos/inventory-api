@@ -74,11 +74,19 @@ class _FailingCursor:
         self._fake_db = fake_db
         self._fail_on = fail_on
         self.rowcount = 0
+        self._rows = []
 
     def execute(self, sql, params=()):
         if self._fail_on and sql.startswith(self._fail_on):
             raise RuntimeError(f"injected failure on {self._fail_on!r}")
-        self.rowcount = self._fake_db.execute(sql, params)
+        if "RETURNING" in sql:
+            self.rowcount, self._rows = self._fake_db.execute_returning(sql, params)
+        else:
+            self._rows = []
+            self.rowcount = self._fake_db.execute(sql, params)
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
 
 
 class _RollbackConnection:
@@ -191,3 +199,63 @@ def test_release_reservation_delete_failure_rolls_back_restore(fake_db, real_txn
     assert fake_db.items[0]["quantity"] == 5
     assert len(fake_db.reservations) == 1
     assert conns[0].rolled_back and not conns[0].committed
+
+
+# -- idempotent release: stock is restored at most once per reservation --
+#
+# Chosen contract: a second release (or a release of an id that never
+# existed / belongs to another tenant) claims no reservation row, leaves
+# stock untouched and returns 404 -- the endpoint's existing "missing
+# reservation" response.
+
+
+def test_release_reservation_twice_restores_stock_once(client, fake_db):
+    _seed_release(fake_db)
+    headers = {"X-Tenant-Id": "tenant-a"}
+    first = client.post("/reservations/order-1/release", headers=headers)
+    assert first.status_code == 200
+    assert first.json() == {"order_id": "order-1", "released": 3}
+    second = client.post("/reservations/order-1/release", headers=headers)
+    assert second.status_code == 404
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
+
+
+def test_release_reservation_twice_restores_stock_once_real_txn(fake_db, real_txn):
+    _, conns = real_txn
+    _seed_release(fake_db)
+    client = TestClient(app)
+    headers = {"X-Tenant-Id": "tenant-a"}
+    assert (
+        client.post("/reservations/order-1/release", headers=headers).status_code == 200
+    )
+    assert (
+        client.post("/reservations/order-1/release", headers=headers).status_code == 404
+    )
+    assert fake_db.items[0]["quantity"] == 8
+    # Second call claimed nothing, so its transaction committed no writes.
+    assert len(conns) == 2
+    assert conns[0].committed
+    assert not conns[1].committed
+
+
+def test_release_nonexistent_reservation_does_not_touch_stock(client, fake_db):
+    _seed_release(fake_db)
+    resp = client.post(
+        "/reservations/does-not-exist/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1
+
+
+def test_release_other_tenants_reservation_claims_nothing(client, fake_db):
+    _seed_release(fake_db)
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-b")
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-b"}
+    )
+    assert resp.status_code == 404
+    assert [i["quantity"] for i in fake_db.items] == [5, 5]
+    assert len(fake_db.reservations) == 1
+    assert fake_db.reservations[0]["tenant_id"] == "tenant-a"
