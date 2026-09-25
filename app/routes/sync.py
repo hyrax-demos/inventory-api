@@ -4,6 +4,7 @@ Pulls current pricing from the warehouse provider (over an allow-listed host)
 and writes it back onto our item rows. Also exposes the reservation-release
 path used when an order is cancelled or fulfilled.
 """
+
 import urllib.parse
 import urllib.request
 
@@ -83,5 +84,5 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
             "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s",
             (order_id, x_tenant_id),
         )
-    cache.invalidate(cache.stock_key(res["sku"]))
+    cache.invalidate(cache.stock_key(x_tenant_id, res["warehouse_id"], res["sku"]))
     return {"order_id": order_id, "released": res["quantity"]}
