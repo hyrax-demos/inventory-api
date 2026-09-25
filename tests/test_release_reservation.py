@@ -1,0 +1,161 @@
+"""Atomicity of POST /reservations/{order_id}/release.
+
+The stock restore and the reservation delete must commit together or not at
+all. These tests route the handler through the real ``app.db.transaction``
+helper, backed by a fake connection that stages writes and applies them to
+the in-memory FakeDB only on ``commit()``. That gives true rollback semantics
+without needing Postgres.
+"""
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app import cache
+from app import db as db_module
+from app.main import app
+from app.routes import sync as sync_routes
+
+TENANT_A = {"X-Tenant-Id": "tenant-a"}
+
+
+class _StagingCursor:
+    def __init__(self, conn: "_StagingConnection"):
+        self._conn = conn
+        self.rowcount = 0
+
+    def execute(self, sql: str, params: tuple = ()) -> None:
+        if self._conn.fail_on and sql.startswith(self._conn.fail_on):
+            raise RuntimeError(f"simulated DB failure on: {sql}")
+        self._conn.pending.append((sql, params))
+
+    def close(self) -> None:
+        pass
+
+
+class _StagingConnection:
+    """Buffers writes; applies them to the FakeDB only on commit."""
+
+    def __init__(self, fake_db, fail_on: str | None = None):
+        self._fake_db = fake_db
+        self.fail_on = fail_on
+        self.pending: list[tuple[str, tuple]] = []
+        self.committed = False
+        self.rolled_back = False
+        self.closed = False
+
+    def cursor(self, cursor_factory=None):
+        return _StagingCursor(self)
+
+    def commit(self) -> None:
+        for sql, params in self.pending:
+            self._fake_db.execute(sql, params)
+        self.pending.clear()
+        self.committed = True
+
+    def rollback(self) -> None:
+        self.pending.clear()
+        self.rolled_back = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def staging(monkeypatch, fake_db):
+    """Use the real transaction() helper over a staging fake connection.
+
+    Returns a factory: call it with ``fail_on=<SQL prefix>`` to make that
+    statement raise inside the transaction.
+    """
+    conns: list[_StagingConnection] = []
+
+    def install(fail_on: str | None = None):
+        def get_connection():
+            conn = _StagingConnection(fake_db, fail_on=fail_on)
+            conns.append(conn)
+            return conn
+
+        monkeypatch.setattr(db_module, "get_connection", get_connection)
+        monkeypatch.setattr(sync_routes, "transaction", db_module.transaction)
+        return conns
+
+    return install
+
+
+def _seed(fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+
+
+def test_release_restores_stock_and_removes_reservation(client, fake_db, staging):
+    conns = staging()
+    _seed(fake_db)
+
+    resp = client.post("/reservations/order-1/release", headers=TENANT_A)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"order_id": "order-1", "released": 3}
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
+    # Both writes went through a single committed transaction.
+    assert len(conns) == 1
+    assert conns[0].committed and not conns[0].rolled_back and conns[0].closed
+
+
+def test_release_invalidates_stock_cache_after_commit(client, fake_db, staging):
+    staging()
+    _seed(fake_db)
+    cache.put(cache.stock_key("WIDGET"), {"quantity": 5})
+
+    resp = client.post("/reservations/order-1/release", headers=TENANT_A)
+
+    assert resp.status_code == 200
+    assert cache.get(cache.stock_key("WIDGET")) is None
+
+
+@pytest.mark.parametrize(
+    "fail_on",
+    ["UPDATE items SET quantity = quantity + %s", "DELETE FROM reservations"],
+    ids=["stock-restore-fails", "reservation-delete-fails"],
+)
+def test_release_failure_rolls_back_everything(fake_db, staging, fail_on):
+    conns = staging(fail_on=fail_on)
+    _seed(fake_db)
+    cache.put(cache.stock_key("WIDGET"), {"quantity": 5})
+    client = TestClient(app, raise_server_exceptions=False)
+
+    resp = client.post("/reservations/order-1/release", headers=TENANT_A)
+
+    assert resp.status_code == 500
+    # Stock unchanged and the reservation row still present.
+    assert fake_db.items[0]["quantity"] == 5
+    assert fake_db.reservations == [
+        {
+            "order_id": "order-1",
+            "tenant_id": "tenant-a",
+            "sku": "WIDGET",
+            "warehouse_id": "w1",
+            "quantity": 3,
+        }
+    ]
+    assert len(conns) == 1
+    assert conns[0].rolled_back and not conns[0].committed and conns[0].closed
+    # No cache invalidation for a release that did not happen.
+    assert cache.get(cache.stock_key("WIDGET")) == {"quantity": 5}
+
+
+def test_release_failure_propagates_exception(fake_db, staging, client):
+    staging(fail_on="UPDATE items SET quantity = quantity + %s")
+    _seed(fake_db)
+
+    with pytest.raises(RuntimeError, match="simulated DB failure"):
+        client.post("/reservations/order-1/release", headers=TENANT_A)
+
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1
