@@ -68,11 +68,17 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
     # Lookup, stock restore and reservation delete share one transaction:
     # if any statement fails, everything rolls back, so the reservation row
     # survives (and can be retried) and no stock is lost.
+    #
+    # The lookup takes a row lock (FOR UPDATE), so it is the race-safe gate
+    # for the restore: a concurrent release of the same reservation blocks
+    # here until this transaction commits, then finds the row gone and 404s
+    # instead of restoring the stock a second time.
     with transaction() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
             "SELECT sku, warehouse_id, quantity FROM reservations "
-            "WHERE order_id = %s AND tenant_id = %s",
+            "WHERE order_id = %s AND tenant_id = %s "
+            "FOR UPDATE",
             (order_id, x_tenant_id),
         )
         res = cur.fetchone()

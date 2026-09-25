@@ -137,3 +137,92 @@ def test_release_reservation_rolls_back_when_stock_restore_fails(fake_db, monkey
             "quantity": 4,
         }
     ]
+
+
+def test_release_reservation_twice_restores_stock_once(client, fake_db):
+    fake_db.add_item(sku="GADGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-4",
+        tenant_id="tenant-a",
+        sku="GADGET",
+        warehouse_id="w1",
+        quantity=4,
+    )
+    headers = {"X-Tenant-Id": "tenant-a"}
+
+    first = client.post("/reservations/order-4/release", headers=headers)
+    assert first.status_code == 200
+    stock_after_first = fake_db.items[0]["quantity"]
+    assert stock_after_first == 14
+
+    second = client.post("/reservations/order-4/release", headers=headers)
+    assert second.status_code == 404
+    assert fake_db.items[0]["quantity"] == stock_after_first
+
+
+def test_release_unknown_reservation_leaves_stock_unchanged(client, fake_db):
+    fake_db.add_item(sku="GADGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    resp = client.post(
+        "/reservations/no-such-order/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 10
+
+
+def test_release_other_tenants_reservation_is_not_found(client, fake_db):
+    fake_db.add_item(sku="GADGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="GADGET", warehouse_id="w1", quantity=7, tenant_id="tenant-b")
+    fake_db.add_reservation(
+        order_id="order-5",
+        tenant_id="tenant-b",
+        sku="GADGET",
+        warehouse_id="w1",
+        quantity=2,
+    )
+    resp = client.post(
+        "/reservations/order-5/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 404
+    assert [i["quantity"] for i in fake_db.items] == [10, 7]
+    assert len(fake_db.reservations) == 1
+
+
+def test_release_reservation_lookup_locks_the_row(fake_db, monkeypatch):
+    # The existence check must be a locking read so a concurrent release of
+    # the same reservation cannot also pass it before this one commits.
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    fake_db.add_item(sku="GADGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-6",
+        tenant_id="tenant-a",
+        sku="GADGET",
+        warehouse_id="w1",
+        quantity=1,
+    )
+    seen = []
+    real_fetch_all = fake_db.fetch_all
+
+    def recording_fetch_all(sql, params=()):
+        seen.append(sql)
+        return real_fetch_all(sql, params)
+
+    monkeypatch.setattr(fake_db, "fetch_all", recording_fetch_all)
+    resp = TestClient(app).post(
+        "/reservations/order-6/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+    lookups = [s for s in seen if "FROM reservations" in s]
+    assert lookups and all("FOR UPDATE" in s for s in lookups)
+    assert all("tenant_id = %s" in s for s in lookups)
+
+
+def test_concurrent_release_restores_stock_once():
+    import pytest
+
+    pytest.skip(
+        "test backend is an in-process FakeDB with no real row locks; "
+        "concurrent release needs a real Postgres with separate connections"
+    )
