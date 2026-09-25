@@ -4,6 +4,7 @@ Pulls current pricing from the warehouse provider (over an allow-listed host)
 and writes it back onto our item rows. Also exposes the reservation-release
 path used when an order is cancelled or fulfilled.
 """
+
 import urllib.parse
 import urllib.request
 
@@ -11,7 +12,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache, config
 from app.auth import require_admin
-from app.db import execute, fetch_one
+from app.db import execute, transaction
 
 router = APIRouter()
 
@@ -63,25 +64,31 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
     Called on order cancellation. Returns the stock to the item it was held
     against and clears the reservation row.
     """
-    res = fetch_one(
-        "SELECT sku, warehouse_id, quantity FROM reservations "
-        "WHERE order_id = %s AND tenant_id = %s",
-        (order_id, x_tenant_id),
-    )
-    if res is None:
-        raise HTTPException(status_code=404, detail="no such reservation")
-
-    try:
-        execute(
-            "UPDATE items SET quantity = quantity + %s "
-            "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-            (res["quantity"], res["sku"], res["warehouse_id"], x_tenant_id),
-        )
-    finally:
-        # Drop the reservation row now that the stock has been returned.
-        execute(
-            "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s",
+    # Claim the reservation by deleting it first, inside the same transaction
+    # as the stock restore. The quantity restored comes only from the row this
+    # transaction actually removed, never from a separate earlier read, so a
+    # repeat (or concurrent) release finds nothing to delete and cannot
+    # restore stock twice. If the restore fails, the whole transaction rolls
+    # back and the reservation row is left in place.
+    with transaction() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s "
+            "RETURNING sku, warehouse_id, quantity",
             (order_id, x_tenant_id),
         )
-    cache.invalidate(cache.stock_key(res["sku"]))
-    return {"order_id": order_id, "released": res["quantity"]}
+        row = cur.fetchone()
+        if row is None:
+            # Already released, never existed, or owned by another tenant.
+            raise HTTPException(status_code=404, detail="no such reservation")
+        sku, warehouse_id, quantity = row
+        cur.execute(
+            "UPDATE items SET quantity = quantity + %s "
+            "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
+            (quantity, sku, warehouse_id, x_tenant_id),
+        )
+    # Only reached once a release has actually committed. The key comes from
+    # the released row (not request input) and is built by the same helper
+    # GET /items/{sku}/stock reads with.
+    cache.invalidate_stock(x_tenant_id, warehouse_id, sku)
+    return {"order_id": order_id, "released": quantity}
