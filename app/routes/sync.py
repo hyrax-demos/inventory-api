@@ -8,11 +8,12 @@ path used when an order is cancelled or fulfilled.
 import urllib.parse
 import urllib.request
 
+import psycopg2.extras
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache, config
 from app.auth import require_admin
-from app.db import execute, fetch_one, transaction
+from app.db import execute, transaction
 
 router = APIRouter()
 
@@ -64,27 +65,31 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
     Called on order cancellation. Returns the stock to the item it was held
     against and clears the reservation row.
     """
-    res = fetch_one(
-        "SELECT sku, warehouse_id, quantity FROM reservations "
-        "WHERE order_id = %s AND tenant_id = %s",
-        (order_id, x_tenant_id),
-    )
-    if res is None:
-        raise HTTPException(status_code=404, detail="no such reservation")
-
-    # Restore the stock and drop the reservation row as one unit of work: if
-    # either statement fails the transaction rolls back, so the reservation
-    # survives (and can be retried) and stock is left untouched.
+    # Claim the reservation by deleting it first, inside the same transaction
+    # as the stock restore. DELETE ... RETURNING hands back the row only to
+    # the one request that actually removed it: Postgres row-locks the target,
+    # so a concurrent second release blocks, then sees the row gone and gets
+    # nothing back. Stock is restored only from the row we removed, so a
+    # reservation can never return its stock twice. If the stock update fails
+    # the transaction rolls back and the reservation row survives for a retry.
     with transaction() as conn:
-        cur = conn.cursor()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s "
+            "RETURNING sku, warehouse_id, quantity, tenant_id",
+            (order_id, x_tenant_id),
+        )
+        res = cur.fetchone()
+        if res is None:
+            # Already released, never existed, or belongs to another tenant:
+            # nothing was removed, so stock is left untouched. Like the sibling
+            # routes in app/routes/ (items, sync_single_item), a missing row is
+            # a 404 rather than a no-op success.
+            raise HTTPException(status_code=404, detail="no such reservation")
         cur.execute(
             "UPDATE items SET quantity = quantity + %s "
             "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-            (res["quantity"], res["sku"], res["warehouse_id"], x_tenant_id),
-        )
-        cur.execute(
-            "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s",
-            (order_id, x_tenant_id),
+            (res["quantity"], res["sku"], res["warehouse_id"], res["tenant_id"]),
         )
     # Only reached once the transaction has committed.
     cache.invalidate(cache.stock_key(res["sku"]))

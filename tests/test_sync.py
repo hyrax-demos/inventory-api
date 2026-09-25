@@ -129,3 +129,48 @@ def test_release_reservation_delete_failure_rolls_back_stock(fake_db, monkeypatc
     assert resp.status_code == 500
     assert len(fake_db.reservations) == 1
     assert fake_db.items[0]["quantity"] == 5
+
+
+def test_release_reservation_twice_restores_stock_once(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    reserve = client.post(
+        "/items/reserve",
+        json={"sku": "WIDGET", "warehouse_id": "w1", "quantity": 4, "order_id": "o-2"},
+        headers={"X-Tenant-Id": "tenant-a"},
+    )
+    assert reserve.status_code == 200
+    assert fake_db.items[0]["quantity"] == 6
+
+    first = client.post(
+        "/reservations/o-2/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert first.status_code == 200
+    assert first.json() == {"order_id": "o-2", "released": 4}
+    assert fake_db.items[0]["quantity"] == 10
+
+    second = client.post(
+        "/reservations/o-2/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert second.status_code == 404
+    # Stock went back up by the reserved quantity exactly once.
+    assert fake_db.items[0]["quantity"] == 10
+    assert fake_db.reservations == []
+
+
+def test_release_nonexistent_reservation_leaves_stock_unchanged(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    resp = client.post(
+        "/reservations/never-existed/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+
+
+def test_release_other_tenants_reservation_is_404(client, fake_db):
+    _seed_reservation(fake_db)
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-b"}
+    )
+    assert resp.status_code == 404
+    assert len(fake_db.reservations) == 1
+    assert fake_db.items[0]["quantity"] == 5

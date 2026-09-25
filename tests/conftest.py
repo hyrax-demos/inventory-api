@@ -44,6 +44,7 @@ class FakeDB:
         self.reservations: list[dict] = []
         self.movements: list[dict] = []
         self._next_id = 1
+        self.last_returning: list[dict] = []
 
     # -- seeding helpers used by tests --
     def add_item(self, **kw) -> dict:
@@ -283,13 +284,15 @@ class FakeDB:
 
         if sql.startswith("DELETE FROM reservations"):
             order_id, tenant_id = params
-            before = len(self.reservations)
-            self.reservations = [
+            removed = [
                 r
                 for r in self.reservations
-                if not (r["order_id"] == order_id and r["tenant_id"] == tenant_id)
+                if r["order_id"] == order_id and r["tenant_id"] == tenant_id
             ]
-            return before - len(self.reservations)
+            self.reservations = [r for r in self.reservations if r not in removed]
+            # Rows a ``DELETE ... RETURNING`` would hand back to the cursor.
+            self.last_returning = [dict(r) for r in removed]
+            return len(removed)
 
         if sql.startswith("UPDATE items SET quantity = 0"):
             (tenant_id,) = params
@@ -373,7 +376,16 @@ class _FakeCursor:
         if sql.lstrip().upper().startswith("SELECT"):
             self._rows = self._fake_db.fetch_all(sql, params)
         else:
+            self._fake_db.last_returning = []
             self._rowcount = self._fake_db.execute(sql, params)
+            if " RETURNING " in sql.upper():
+                cols = [
+                    c.strip()
+                    for c in sql.upper().split(" RETURNING ", 1)[1].lower().split(",")
+                ]
+                self._rows = [
+                    {c: r[c] for c in cols} for r in self._fake_db.last_returning
+                ]
 
     def fetchall(self):
         return self._rows
