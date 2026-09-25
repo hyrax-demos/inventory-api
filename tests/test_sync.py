@@ -107,3 +107,65 @@ def test_release_reservation_restore_failure_keeps_reservation(fake_db, monkeypa
     assert fake_db.reservations[0]["order_id"] == "order-1"
     # ...and the stock level is untouched.
     assert fake_db.items[0]["quantity"] == 5
+
+
+# Idempotency convention: releasing a reservation that is already gone
+# (released earlier, or never existed) returns 404 and never touches stock.
+
+
+def test_release_reservation_twice_restores_stock_once(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    first = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert first.status_code == 200
+    assert fake_db.items[0]["quantity"] == 8
+
+    second = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert second.status_code == 404
+    # Stock was restored exactly once.
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
+
+
+def test_release_unknown_reservation_changes_no_stock(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    resp = client.post(
+        "/reservations/does-not-exist/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1
+
+
+def test_release_reservation_other_tenant_is_404_and_changes_no_stock(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-b"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1

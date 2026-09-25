@@ -8,11 +8,12 @@ path used when an order is cancelled or fulfilled.
 import urllib.parse
 import urllib.request
 
+import psycopg2.extras
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache, config
 from app.auth import require_admin
-from app.db import execute, fetch_one, transaction
+from app.db import execute, transaction
 
 router = APIRouter()
 
@@ -64,19 +65,25 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
     Called on order cancellation. Returns the stock to the item it was held
     against and clears the reservation row.
     """
-    res = fetch_one(
-        "SELECT sku, warehouse_id, quantity FROM reservations "
-        "WHERE order_id = %s AND tenant_id = %s",
-        (order_id, x_tenant_id),
-    )
-    if res is None:
-        raise HTTPException(status_code=404, detail="no such reservation")
-
-    # Restore the stock and drop the reservation in ONE transaction: if the
-    # restore fails, the delete is rolled back too, so the reservation row
-    # survives and the release can be retried.
+    # The lookup, the stock restore and the delete all run in ONE transaction.
+    # SELECT ... FOR UPDATE locks the reservation row, so a concurrent release
+    # of the same order blocks until this one commits and then finds no row
+    # (Postgres re-checks the locked row under READ COMMITTED). That makes a
+    # repeat release a 404 that never touches stock, instead of a racy
+    # read-then-write that could restore the quantity twice. If the restore
+    # fails, the delete is rolled back too, so the reservation row survives
+    # and the release can be retried.
     with transaction() as conn:
-        cur = conn.cursor()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT sku, warehouse_id, quantity FROM reservations "
+            "WHERE order_id = %s AND tenant_id = %s FOR UPDATE",
+            (order_id, x_tenant_id),
+        )
+        res = cur.fetchone()
+        if res is None:
+            # Already released (or never existed): leave stock untouched.
+            raise HTTPException(status_code=404, detail="no such reservation")
         cur.execute(
             "UPDATE items SET quantity = quantity + %s "
             "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
