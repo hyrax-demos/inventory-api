@@ -1,12 +1,15 @@
 """Report generation and snapshot import."""
 
 import json
+import logging
 from datetime import datetime
 
 from fastapi import APIRouter, Header, HTTPException
 
-from app.db import execute, fetch_all
+from app.db import fetch_all, transaction
 from app.routes.items import _tenant
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -70,7 +73,9 @@ async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
     items = payload.get("items")
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="items must be a list")
-    count = 0
+    # Validate every entry before touching the database, so a malformed
+    # entry anywhere in the list rejects the whole snapshot with no writes.
+    updates = []
     for entry in items:
         try:
             sku = entry["sku"]
@@ -78,10 +83,23 @@ async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
             quantity = int(entry["quantity"])
         except (KeyError, TypeError, ValueError):
             raise HTTPException(status_code=400, detail="malformed snapshot entry")
-        execute(
-            "UPDATE items SET quantity = %s "
-            "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-            (quantity, sku, warehouse_id, x_tenant_id),
-        )
-        count += 1
+        if not isinstance(sku, str) or not isinstance(warehouse_id, str):
+            raise HTTPException(status_code=400, detail="malformed snapshot entry")
+        updates.append((quantity, sku, warehouse_id, x_tenant_id))
+
+    # Apply all updates in one transaction: committed once at the end, rolled
+    # back entirely if any write fails.
+    try:
+        with transaction() as conn:
+            cur = conn.cursor()
+            for params in updates:
+                cur.execute(
+                    "UPDATE items SET quantity = %s "
+                    "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
+                    params,
+                )
+    except Exception:
+        logger.exception("snapshot import failed; rolled back")
+        raise HTTPException(status_code=500, detail="snapshot import failed")
+    count = len(updates)
     return {"items": count, "snapshot": json.dumps({"received": count})}
