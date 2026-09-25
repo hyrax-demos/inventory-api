@@ -3,6 +3,7 @@
 All endpoints require the shared admin token (``require_admin``) and are scoped
 to the caller's tenant.
 """
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache
@@ -38,9 +39,7 @@ def delete_item(item_id: str, x_tenant_id: str = Header()):
 def update_item(item_id: str, patch: ItemUpdate, x_tenant_id: str = Header()):
     """Apply a partial update to an item using only whitelisted columns."""
     fields = {
-        k: v
-        for k, v in patch.model_dump(exclude_unset=True).items()
-        if k in _PATCHABLE
+        k: v for k, v in patch.model_dump(exclude_unset=True).items() if k in _PATCHABLE
     }
     if not fields:
         raise HTTPException(status_code=400, detail="no patchable fields")
@@ -64,5 +63,7 @@ def bulk_adjust(adjustments: list[StockAdjustment], x_tenant_id: str = Header())
             "WHERE sku = %s AND tenant_id = %s",
             (adj.delta, adj.sku, x_tenant_id),
         )
-        cache.invalidate(cache.stock_key(adj.sku))
+        # The update spans every warehouse holding this SKU, so drop all of
+        # the tenant's cached per-warehouse entries for it.
+        cache.invalidate_stock(x_tenant_id, adj.sku)
     return {"adjusted": len(adjustments)}
