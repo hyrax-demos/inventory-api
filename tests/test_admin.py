@@ -36,7 +36,9 @@ def test_delete_item_not_found(client, fake_db):
 
 
 def test_update_item(client, fake_db):
-    row = fake_db.add_item(sku="A", name="old", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    row = fake_db.add_item(
+        sku="A", name="old", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
+    )
     resp = client.post(
         f"/admin/items/{row['id']}/update",
         json={"name": "new"},
@@ -64,3 +66,22 @@ def test_bulk_adjust(client, fake_db):
     assert resp.json()["adjusted"] == 2
     by_sku = {r["sku"]: r["quantity"] for r in fake_db.items}
     assert by_sku == {"A": 6, "B": 0}
+
+
+def test_bulk_adjust_is_reflected_on_next_stock_read(client, fake_db):
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    fake_db.add_item(sku="A", warehouse_id="w2", quantity=2, tenant_id="tenant-a")
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=7, tenant_id="tenant-b")
+    headers_b = {"X-Tenant-Id": "tenant-b"}
+
+    def stock(wh, headers=TENANT_A):
+        return client.get(
+            "/items/A/stock", params={"warehouse_id": wh}, headers=headers
+        ).json()["quantity"]
+
+    assert (stock("w1"), stock("w2"), stock("w1", headers_b)) == (1, 2, 7)
+    resp = client.post(
+        "/admin/items/bulk-adjust", json=[{"sku": "A", "delta": 5}], headers=TENANT_A
+    )
+    assert resp.status_code == 200
+    assert (stock("w1"), stock("w2"), stock("w1", headers_b)) == (6, 7, 7)
