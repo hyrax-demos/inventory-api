@@ -1,9 +1,10 @@
 """Inventory item lookup, search, and stock reservation."""
+
 from fastapi import APIRouter, Header, HTTPException
 
 from app import cache
 from app.db import execute, fetch_all, fetch_one
-from app.models import Page, ReservationRequest
+from app.models import ItemUpdate, Page, ReservationRequest
 
 router = APIRouter()
 
@@ -24,6 +25,51 @@ def get_item(sku: str, x_tenant_id: str = Header()):
     if row is None:
         raise HTTPException(status_code=404, detail="not found")
     return row
+
+
+# Columns a PATCH /items/{sku} request may change. Kept explicit so a model
+# field added later is never interpolated into SQL without review.
+_PATCHABLE = ("name", "price", "warehouse_id")
+
+
+@router.patch("/items/{sku}")
+def patch_item(sku: str, patch: ItemUpdate, x_tenant_id: str = Header()):
+    """Partially update an item: only fields present (and non-null) change."""
+    tenant_id = _tenant(x_tenant_id)
+    row = fetch_one(
+        "SELECT * FROM items WHERE sku = %s AND tenant_id = %s",
+        (sku, tenant_id),
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="not found")
+
+    fields = {
+        k: v
+        for k, v in patch.model_dump(exclude_unset=True).items()
+        if k in _PATCHABLE and v is not None
+    }
+    if not fields:
+        return row
+
+    set_clause = ", ".join(f"{col} = %s" for col in fields)
+    affected = execute(
+        f"UPDATE items SET {set_clause} WHERE id = %s AND tenant_id = %s",
+        (*fields.values(), row["id"], tenant_id),
+    )
+    if affected == 0:
+        # Deleted between the lookup and the update.
+        raise HTTPException(status_code=404, detail="not found")
+
+    cache.invalidate(cache.stock_key(sku))
+    cache.invalidate(cache.price_key(sku, row["warehouse_id"]))
+
+    updated = fetch_one(
+        "SELECT * FROM items WHERE sku = %s AND tenant_id = %s",
+        (sku, tenant_id),
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return updated
 
 
 @router.get("/items")

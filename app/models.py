@@ -1,5 +1,6 @@
 """Domain models for the inventory API."""
-from pydantic import BaseModel
+
+from pydantic import BaseModel, Field
 
 
 class Item(BaseModel):
@@ -27,7 +28,7 @@ class ItemUpdate(BaseModel):
     """Whitelisted fields the ops dashboard may patch on an item."""
 
     name: str | None = None
-    price: float | None = None
+    price: float | None = Field(default=None, ge=0)
     warehouse_id: str | None = None
 
 
