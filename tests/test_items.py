@@ -126,3 +126,76 @@ def test_reserve_stock_missing_item(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 404
+
+
+def test_get_stock_does_not_leak_across_warehouses(client, fake_db):
+    """Caching the same SKU in two warehouses must not cross-contaminate."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=99, tenant_id="tenant-a")
+
+    resp_w1 = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    assert resp_w1.json()["quantity"] == 10
+
+    # A second warehouse's stock for the same SKU must read its own value,
+    # not the cached value from w1.
+    resp_w2 = client.get("/items/WIDGET/stock", params={"warehouse_id": "w2"}, headers=TENANT_A)
+    assert resp_w2.json()["quantity"] == 99
+
+    # And re-reading w1 still returns w1's (cached) value.
+    resp_w1_again = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    assert resp_w1_again.json()["quantity"] == 10
+
+
+def test_get_stock_does_not_leak_across_tenants(client, fake_db):
+    """Two tenants with the same SKU/warehouse must not share a cache entry."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=50, tenant_id="tenant-b")
+
+    resp_a = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    assert resp_a.json()["quantity"] == 10
+
+    resp_b = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_B)
+    assert resp_b.json()["quantity"] == 50
+
+
+def test_reserve_stock_invalidates_the_read_cache_for_its_own_warehouse(client, fake_db):
+    """A reservation must be reflected on the very next read for that
+    tenant+warehouse+sku, even though the stock was cached before the
+    reservation."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+
+    # Warm the cache.
+    first = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    assert first.json()["quantity"] == 10
+
+    resp = client.post(
+        "/items/reserve",
+        json={"sku": "WIDGET", "warehouse_id": "w1", "quantity": 3, "order_id": "order-1"},
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+
+    second = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    assert second.json()["quantity"] == 7
+
+
+def test_reserve_stock_does_not_invalidate_a_different_warehouse(client, fake_db):
+    """Reserving stock in one warehouse must not evict the (still-valid)
+    cached stock of the same SKU in a different warehouse."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=20, tenant_id="tenant-a")
+
+    # Warm w2's cache entry.
+    warm = client.get("/items/WIDGET/stock", params={"warehouse_id": "w2"}, headers=TENANT_A)
+    assert warm.json()["quantity"] == 20
+
+    resp = client.post(
+        "/items/reserve",
+        json={"sku": "WIDGET", "warehouse_id": "w1", "quantity": 3, "order_id": "order-1"},
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+
+    # w2's cached value is untouched by a w1 reservation.
+    still_cached = client.get("/items/WIDGET/stock", params={"warehouse_id": "w2"}, headers=TENANT_A)
+    assert still_cached.json()["quantity"] == 20

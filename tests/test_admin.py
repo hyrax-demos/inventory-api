@@ -64,3 +64,42 @@ def test_bulk_adjust(client, fake_db):
     assert resp.json()["adjusted"] == 2
     by_sku = {r["sku"]: r["quantity"] for r in fake_db.items}
     assert by_sku == {"A": 6, "B": 0}
+
+
+def test_bulk_adjust_invalidates_the_read_cache_for_its_warehouse(client, fake_db):
+    """A bulk adjustment must be reflected on the very next stock read for
+    that tenant+warehouse+sku, even though the stock was cached beforehand."""
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+
+    warm = client.get("/items/A/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    assert warm.json()["quantity"] == 1
+
+    resp = client.post(
+        "/admin/items/bulk-adjust",
+        json=[{"sku": "A", "delta": 5}],
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+
+    after = client.get("/items/A/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    assert after.json()["quantity"] == 6
+
+
+def test_bulk_adjust_does_not_invalidate_a_different_tenants_cache(client, fake_db):
+    """Adjusting tenant-a's stock must not evict tenant-b's cached entry for
+    the same SKU/warehouse."""
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=42, tenant_id="tenant-b")
+
+    warm = client.get("/items/A/stock", params={"warehouse_id": "w1"}, headers={"X-Tenant-Id": "tenant-b"})
+    assert warm.json()["quantity"] == 42
+
+    resp = client.post(
+        "/admin/items/bulk-adjust",
+        json=[{"sku": "A", "delta": 5}],
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+
+    still_cached = client.get("/items/A/stock", params={"warehouse_id": "w1"}, headers={"X-Tenant-Id": "tenant-b"})
+    assert still_cached.json()["quantity"] == 42

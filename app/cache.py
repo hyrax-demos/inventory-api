@@ -35,9 +35,14 @@ def invalidate(key: str) -> None:
     _store.pop(key, None)
 
 
-def stock_key(sku: str) -> str:
-    """Cache key for a SKU's stock snapshot."""
-    return f"stock:{sku}"
+def stock_key(tenant_id: str, warehouse_id: str, sku: str) -> str:
+    """Cache key for a SKU's stock snapshot in a given tenant + warehouse.
+
+    Stock is per-tenant and per-warehouse, so the key must include both --
+    otherwise two tenants (or two warehouses) sharing a SKU would read each
+    other's cached quantity.
+    """
+    return f"stock:{tenant_id}:{warehouse_id}:{sku}"
 
 
 def price_key(sku: str, warehouse_id: str) -> str:

@@ -65,6 +65,13 @@ class FakeDB:
         params = list(params)
         if "ORDER BY id ASC LIMIT" in sql:
             return self._search_items(sql, params)
+        if sql.startswith("SELECT warehouse_id FROM items"):
+            sku, tenant_id = params
+            return [
+                {"warehouse_id": r["warehouse_id"]}
+                for r in self.items
+                if r["sku"] == sku and r["tenant_id"] == tenant_id
+            ]
         if "quantity <= %s" in sql:
             tenant_id, threshold = params
             rows = [
