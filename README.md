@@ -23,23 +23,23 @@ uvicorn app.main:app --reload
 
 | Method | Path                            | Description                          |
 | ------ | ------------------------------- | ------------------------------------ |
-| GET    | `/health`                       | Liveness check                       |
-| GET    | `/items/{sku}`                  | Look up a single item                |
-| PATCH  | `/items/{sku}`                  | Partially update `name`, `price`, `warehouse_id` |
-| GET    | `/items`                        | Search items (paginated)             |
-| GET    | `/items/{sku}/stock`            | On-hand quantity (cached)            |
-| POST   | `/items/reserve`                | Reserve stock for an order           |
-| GET    | `/reports/low-stock`            | Items at/below `threshold` (paginated: `limit`, `cursor`) |
-| GET    | `/reports/today`                | Stock movements recorded today       |
-| GET    | `/reports/reserved-value`       | Dollar value of reserved stock       |
-| POST   | `/reports/import`               | Bulk-import a stock snapshot          |
+| POST   | `/admin/items/bulk-adjust`      | Apply stock deltas in bulk           |
 | POST   | `/admin/items/reset`            | Reset all stock to zero (internal)   |
 | DELETE | `/admin/items/{item_id}`        | Delete a discontinued SKU            |
 | POST   | `/admin/items/{item_id}/update` | Patch whitelisted item fields        |
-| POST   | `/admin/items/bulk-adjust`      | Apply stock deltas in bulk           |
-| POST   | `/sync/prices`                  | Sync prices from the provider feed   |
-| POST   | `/sync/item/{sku}`              | Refresh price for one SKU            |
+| GET    | `/health`                       | Liveness check                       |
+| GET    | `/items`                        | Search items (paginated)             |
+| POST   | `/items/reserve`                | Reserve stock for an order           |
+| GET    | `/items/{sku}`                  | Look up a single item                |
+| PATCH  | `/items/{sku}`                  | Partially update `name`, `price`, `warehouse_id` |
+| GET    | `/items/{sku}/stock`            | On-hand quantity (cached)            |
+| POST   | `/reports/import`               | Bulk-import a stock snapshot          |
+| GET    | `/reports/low-stock`            | Items at/below `threshold` (paginated: `limit`, `cursor`) |
+| GET    | `/reports/reserved-value`       | Dollar value of reserved stock       |
+| GET    | `/reports/today`                | Stock movements recorded today       |
 | POST   | `/reservations/{order_id}/release` | Release a reservation             |
+| POST   | `/sync/item/{sku}`              | Refresh price for one SKU            |
+| POST   | `/sync/prices`                  | Sync prices from the provider feed   |
 
 Admin and sync endpoints require the `X-Admin-Token` header.
 
