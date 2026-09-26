@@ -126,3 +126,55 @@ def test_reserve_stock_missing_item(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 404
+
+
+def _stock(client, sku, warehouse_id, headers):
+    resp = client.get(f"/items/{sku}/stock", params={"warehouse_id": warehouse_id}, headers=headers)
+    assert resp.status_code == 200
+    return resp.json()["quantity"]
+
+
+def test_get_stock_cache_is_scoped_by_warehouse(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=99, tenant_id="tenant-a")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    # w1's cached value must not be returned for w2
+    assert _stock(client, "WIDGET", "w2", TENANT_A) == 99
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+
+
+def test_get_stock_cache_is_scoped_by_tenant(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=3, tenant_id="tenant-b")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    # tenant-a's cached value must not be served to tenant-b
+    assert _stock(client, "WIDGET", "w1", TENANT_B) == 3
+
+
+def test_get_stock_cached_value_is_not_served_to_tenant_without_item(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    resp = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_B)
+    assert resp.status_code == 404
+
+
+def test_reserve_stock_is_reflected_on_next_stock_read(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=20, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=30, tenant_id="tenant-b")
+    # prime the cache for every tenant/warehouse
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    assert _stock(client, "WIDGET", "w2", TENANT_A) == 20
+    assert _stock(client, "WIDGET", "w1", TENANT_B) == 30
+
+    resp = client.post(
+        "/items/reserve",
+        json={"sku": "WIDGET", "warehouse_id": "w1", "quantity": 4, "order_id": "order-1"},
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 6
+    # untouched warehouse / tenant keep their (still-correct) values
+    assert _stock(client, "WIDGET", "w2", TENANT_A) == 20
+    assert _stock(client, "WIDGET", "w1", TENANT_B) == 30
