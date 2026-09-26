@@ -1,4 +1,7 @@
 """Domain models for the inventory API."""
+
+from datetime import datetime
+
 from pydantic import BaseModel
 
 
@@ -36,3 +39,26 @@ class Page(BaseModel):
 
     items: list[dict]
     next_cursor: str | None = None
+
+
+class Transfer(BaseModel):
+    """A stock transfer of one SKU between two of a tenant's warehouses."""
+
+    id: str
+    tenant_id: str
+    sku: str
+    source_warehouse_id: str
+    destination_warehouse_id: str
+    quantity: int
+    created_at: datetime
+
+
+class TransferOut(BaseModel):
+    """Public representation of a transfer (tenant_id is never exposed)."""
+
+    id: str
+    sku: str
+    source_warehouse_id: str
+    destination_warehouse_id: str
+    quantity: int
+    created_at: datetime
