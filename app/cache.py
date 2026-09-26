@@ -5,6 +5,7 @@ so we memoize them for a few seconds to take load off Postgres. Entries expire
 on read once they pass their TTL.
 """
 import time
+import urllib.parse
 
 # key -> (expires_at_monotonic, value)
 _store: dict[str, tuple[float, object]] = {}
@@ -35,9 +36,32 @@ def invalidate(key: str) -> None:
     _store.pop(key, None)
 
 
-def stock_key(sku: str) -> str:
-    """Cache key for a SKU's stock snapshot."""
-    return f"stock:{sku}"
+def _part(value: str) -> str:
+    """Encode one key component so a ':' inside it can't forge another key."""
+    return urllib.parse.quote(str(value), safe="")
+
+
+def _stock_prefix(tenant_id: str, sku: str) -> str:
+    return f"stock:{_part(tenant_id)}:{_part(sku)}:"
+
+
+def stock_key(tenant_id: str, sku: str, warehouse_id: str) -> str:
+    """Cache key for a SKU's on-hand quantity at one tenant's warehouse.
+
+    Scoped by tenant, SKU and warehouse so the same SKU in another warehouse,
+    or held by another tenant, never shares a cached value.
+    """
+    return _stock_prefix(tenant_id, sku) + _part(warehouse_id)
+
+
+def invalidate_stock_for_sku(tenant_id: str, sku: str) -> None:
+    """Drop the cached stock for a tenant's SKU in every warehouse.
+
+    Use this for writes that aren't scoped to a single warehouse.
+    """
+    prefix = _stock_prefix(tenant_id, sku)
+    for key in [k for k in _store if k.startswith(prefix)]:
+        _store.pop(key, None)
 
 
 def price_key(sku: str, warehouse_id: str) -> str:
