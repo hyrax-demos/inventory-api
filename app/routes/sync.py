@@ -83,5 +83,5 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
             "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s",
             (order_id, x_tenant_id),
         )
-    cache.invalidate(cache.stock_key(res["sku"]))
+    cache.invalidate(cache.stock_key(x_tenant_id, res["sku"], res["warehouse_id"]))
     return {"order_id": order_id, "released": res["quantity"]}

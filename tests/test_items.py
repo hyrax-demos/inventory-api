@@ -126,3 +126,75 @@ def test_reserve_stock_missing_item(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 404
+
+
+def _stock(client, sku, warehouse_id, headers):
+    resp = client.get(f"/items/{sku}/stock", params={"warehouse_id": warehouse_id}, headers=headers)
+    assert resp.status_code == 200
+    return resp.json()["quantity"]
+
+
+def test_get_stock_cache_is_scoped_by_warehouse(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=99, tenant_id="tenant-a")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    # w1's cached value must not be served for w2.
+    assert _stock(client, "WIDGET", "w2", TENANT_A) == 99
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+
+
+def test_get_stock_cache_is_scoped_by_tenant(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=77, tenant_id="tenant-b")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    # tenant-a's cached value must not leak to tenant-b.
+    assert _stock(client, "WIDGET", "w1", TENANT_B) == 77
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+
+
+def test_get_stock_cache_miss_for_other_tenant_does_not_return_cached(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    resp = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_B)
+    assert resp.status_code == 404
+
+
+def test_get_stock_is_served_from_cache(client, fake_db):
+    row = fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    row["quantity"] = 1  # out-of-band change, not invalidated
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+
+
+def test_reserve_stock_is_reflected_on_next_stock_read(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=20, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=30, tenant_id="tenant-b")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    assert _stock(client, "WIDGET", "w2", TENANT_A) == 20
+    assert _stock(client, "WIDGET", "w1", TENANT_B) == 30
+
+    resp = client.post(
+        "/items/reserve",
+        json={"sku": "WIDGET", "warehouse_id": "w1", "quantity": 3, "order_id": "order-1"},
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 7
+    assert _stock(client, "WIDGET", "w2", TENANT_A) == 20
+    assert _stock(client, "WIDGET", "w1", TENANT_B) == 30
+
+
+def test_stock_key_scopes_tenant_sku_and_warehouse():
+    from app import cache
+
+    base = cache.stock_key("tenant-a", "WIDGET", "w1")
+    assert base != cache.stock_key("tenant-b", "WIDGET", "w1")
+    assert base != cache.stock_key("tenant-a", "WIDGET", "w2")
+    assert base != cache.stock_key("tenant-a", "GADGET", "w1")
+    # Separator characters inside a component must not produce collisions.
+    assert cache.stock_key("a:b", "c", "d") != cache.stock_key("a", "b:c", "d")
+    assert cache.stock_key("a", "b:c", "d") != cache.stock_key("a", "b", "c:d")
+    assert base.startswith(cache.stock_sku_prefix("tenant-a", "WIDGET"))
+    assert not cache.stock_key("a", "b:c", "d").startswith(cache.stock_sku_prefix("a", "b"))
