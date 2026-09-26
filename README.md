@@ -50,6 +50,11 @@ The JSON body may contain any of `name`, `price` (must be `>= 0`), and
 empty body returns the item as-is. The response is the updated item. An
 unknown SKU returns `404`.
 
+Changing `price` also requires a valid `X-Admin-Token` header (the same token
+as the admin and sync endpoints); without it the request is rejected with
+`401` and nothing is changed. `name` and `warehouse_id` edits need only
+`X-Tenant-Id`.
+
 ### `GET /reports/low-stock` pagination
 
 | Query param | Default | Description                                            |

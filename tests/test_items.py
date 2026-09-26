@@ -1,5 +1,8 @@
+import os
+
 TENANT_A = {"X-Tenant-Id": "tenant-a"}
 TENANT_B = {"X-Tenant-Id": "tenant-b"}
+ADMIN_HEADERS = {"X-Admin-Token": os.environ["ADMIN_TOKEN"]}
 
 
 def test_get_item_missing_tenant_header_is_rejected(client):
@@ -180,7 +183,9 @@ def test_patch_item_updates_only_set_fields(client, fake_db):
         price=1.5,
         tenant_id="tenant-a",
     )
-    resp = client.patch("/items/WIDGET", json={"price": 2.25}, headers=TENANT_A)
+    resp = client.patch(
+        "/items/WIDGET", json={"price": 2.25}, headers={**TENANT_A, **ADMIN_HEADERS}
+    )
     assert resp.status_code == 200
     body = resp.json()
     assert body["price"] == 2.25
@@ -249,3 +254,36 @@ def test_patch_item_negative_price_rejected(client, fake_db):
 def test_patch_item_missing_tenant_header_is_rejected(client, fake_db):
     resp = client.patch("/items/WIDGET", json={"name": "x"})
     assert resp.status_code in (400, 422)
+
+
+def test_patch_item_price_requires_admin_token(client, fake_db):
+    fake_db.add_item(
+        sku="WIDGET",
+        name="Widget",
+        warehouse_id="w1",
+        quantity=5,
+        price=1.5,
+        tenant_id="tenant-a",
+    )
+    resp = client.patch("/items/WIDGET", json={"price": 0.01}, headers=TENANT_A)
+    assert resp.status_code == 401
+    bad = client.patch(
+        "/items/WIDGET",
+        json={"price": 0.01, "name": "Cheap"},
+        headers={**TENANT_A, "X-Admin-Token": "wrong"},
+    )
+    assert bad.status_code == 401
+    item = next(r for r in fake_db.items if r["sku"] == "WIDGET")
+    assert item["price"] == 1.5
+    assert item["name"] == "Widget"
+
+
+def test_patch_item_non_price_fields_do_not_require_admin(client, fake_db):
+    fake_db.add_item(
+        sku="WIDGET", name="Widget", warehouse_id="w1", quantity=5, tenant_id="tenant-a"
+    )
+    resp = client.patch(
+        "/items/WIDGET", json={"name": "Gadget", "price": None}, headers=TENANT_A
+    )
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "Gadget"

@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Header, HTTPException
 
 from app import cache
+from app.auth import require_admin
 from app.db import execute, fetch_all, fetch_one
 from app.models import ItemUpdate, Page, ReservationRequest
 
@@ -33,9 +34,28 @@ _PATCHABLE = ("name", "price", "warehouse_id")
 
 
 @router.patch("/items/{sku}")
-def patch_item(sku: str, patch: ItemUpdate, x_tenant_id: str = Header()):
-    """Partially update an item: only fields present (and non-null) change."""
+def patch_item(
+    sku: str,
+    patch: ItemUpdate,
+    x_tenant_id: str = Header(),
+    x_admin_token: str = Header(default=""),
+):
+    """Partially update an item: only fields present (and non-null) change.
+
+    ``name`` and ``warehouse_id`` are editable by tenant staff; changing
+    ``price`` additionally requires the admin token, matching the admin
+    update and price-sync endpoints.
+    """
     tenant_id = _tenant(x_tenant_id)
+    fields = {
+        k: v
+        for k, v in patch.model_dump(exclude_unset=True).items()
+        if k in _PATCHABLE and v is not None
+    }
+    if "price" in fields:
+        # Checked before any lookup so an unauthorized caller learns nothing.
+        require_admin(x_admin_token)
+
     row = fetch_one(
         "SELECT * FROM items WHERE sku = %s AND tenant_id = %s",
         (sku, tenant_id),
@@ -43,11 +63,6 @@ def patch_item(sku: str, patch: ItemUpdate, x_tenant_id: str = Header()):
     if row is None:
         raise HTTPException(status_code=404, detail="not found")
 
-    fields = {
-        k: v
-        for k, v in patch.model_dump(exclude_unset=True).items()
-        if k in _PATCHABLE and v is not None
-    }
     if not fields:
         return row
 
