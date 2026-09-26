@@ -1,5 +1,6 @@
 """Domain models for the inventory API."""
-from pydantic import BaseModel
+
+from pydantic import BaseModel, Field
 
 
 class Item(BaseModel):
@@ -27,7 +28,7 @@ class ItemUpdate(BaseModel):
     """Whitelisted fields the ops dashboard may patch on an item."""
 
     name: str | None = None
-    price: float | None = None
+    price: float | None = Field(default=None, ge=0)
     warehouse_id: str | None = None
 
 
@@ -36,3 +37,9 @@ class Page(BaseModel):
 
     items: list[dict]
     next_cursor: str | None = None
+
+
+class LowStockPage(Page):
+    """A page of the low-stock report, echoing the threshold it was run at."""
+
+    threshold: int

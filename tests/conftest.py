@@ -4,6 +4,7 @@ Everything runs in-process against a FakeDB: no Postgres, no network, no
 real secrets. Environment variables the app reads at import time are set
 before ``app.main`` is imported for the first time.
 """
+
 import re
 import os
 from contextlib import contextmanager
@@ -41,7 +42,9 @@ class FakeDB:
         self.items: list[dict] = []
         self.reservations: list[dict] = []
         self.movements: list[dict] = []
+        self.item_updates: list[dict] = []
         self._next_id = 1
+        self._next_update_id = 1
 
     # -- seeding helpers used by tests --
     def add_item(self, **kw) -> dict:
@@ -60,25 +63,28 @@ class FakeDB:
         self.movements.append(row)
         return row
 
+    def add_item_update(self, **kw) -> dict:
+        row = {"id": self._next_update_id, **kw}
+        self._next_update_id += 1
+        self.item_updates.append(row)
+        return row
+
     # -- fetch_all --
     def fetch_all(self, sql: str, params: tuple = ()):
         params = list(params)
+        if sql.startswith("SELECT * FROM items WHERE id = %s AND tenant_id = %s"):
+            item_id, tenant_id = params
+            return [
+                dict(r)
+                for r in self.items
+                if r["id"] == item_id and r["tenant_id"] == tenant_id
+            ]
+        if "FROM item_updates" in sql:
+            return self._item_history(sql, params)
         if "ORDER BY id ASC LIMIT" in sql:
             return self._search_items(sql, params)
         if "quantity <= %s" in sql:
-            tenant_id, threshold = params
-            rows = [
-                {
-                    "sku": r["sku"],
-                    "name": r["name"],
-                    "warehouse_id": r["warehouse_id"],
-                    "quantity": r["quantity"],
-                }
-                for r in self.items
-                if r["tenant_id"] == tenant_id and r["quantity"] <= threshold
-            ]
-            rows.sort(key=lambda r: r["quantity"])
-            return rows
+            return self._low_stock(sql, params)
         if "FROM movements" in sql:
             tenant_id, start_of_day = params
             cutoff = _as_naive(start_of_day)
@@ -147,13 +153,54 @@ class FakeDB:
         rows.sort(key=lambda r: r["id"])
         return [dict(r) for r in rows[:limit_plus1]]
 
+    def _item_history(self, sql: str, params: list):
+        params = list(params)
+        sku, tenant_id = params.pop(0), params.pop(0)
+        limit_plus1 = params.pop(-1)
+        cursor = params.pop(0) if "id <= %s" in sql else None
+        cols = ("id", "sku", "field", "old_value", "new_value", "created_at")
+        rows = [
+            {k: r[k] for k in cols}
+            for r in self.item_updates
+            if r["sku"] == sku and r["tenant_id"] == tenant_id
+        ]
+        if cursor is not None:
+            rows = [r for r in rows if r["id"] <= cursor]
+        rows.sort(key=lambda r: r["id"], reverse=True)
+        return rows[:limit_plus1]
+
+    def _low_stock(self, sql: str, params: list):
+        params = list(params)
+        tenant_id, threshold = params.pop(0), params.pop(0)
+        limit_plus1 = params.pop(-1)
+        cursor = tuple(params) if "(quantity, id) >= (%s, %s)" in sql else None
+        rows = [
+            {
+                "id": r["id"],
+                "sku": r["sku"],
+                "name": r["name"],
+                "warehouse_id": r["warehouse_id"],
+                "quantity": r["quantity"],
+            }
+            for r in self.items
+            if r["tenant_id"] == tenant_id and r["quantity"] <= threshold
+        ]
+        if cursor is not None:
+            rows = [r for r in rows if (r["quantity"], r["id"]) >= cursor]
+        rows.sort(key=lambda r: (r["quantity"], r["id"]))
+        return rows[:limit_plus1]
+
     # -- fetch_one --
     def fetch_one(self, sql: str, params: tuple = ()):
         params = list(params)
         if sql.startswith("SELECT * FROM items WHERE sku = %s AND tenant_id = %s"):
             sku, tenant_id = params
             return next(
-                (dict(r) for r in self.items if r["sku"] == sku and r["tenant_id"] == tenant_id),
+                (
+                    dict(r)
+                    for r in self.items
+                    if r["sku"] == sku and r["tenant_id"] == tenant_id
+                ),
                 None,
             )
         if sql.startswith("SELECT quantity FROM items"):
@@ -200,9 +247,11 @@ class FakeDB:
         if sql.startswith("UPDATE items SET quantity = quantity - %s"):
             delta, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", r["quantity"] - delta),
             )
 
@@ -219,7 +268,10 @@ class FakeDB:
             )
             return 1
 
-        if sql.startswith("UPDATE items SET") and "WHERE id = %s AND tenant_id = %s" in sql:
+        if (
+            sql.startswith("UPDATE items SET")
+            and "WHERE id = %s AND tenant_id = %s" in sql
+        ):
             *values, item_id, tenant_id = params
             cols = re.findall(r"(\w+) = %s", sql.split("WHERE")[0])
             return self._update_items(
@@ -230,27 +282,36 @@ class FakeDB:
         if sql.startswith("UPDATE items SET quantity = %s"):
             quantity, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", quantity),
             )
 
         if sql.startswith("UPDATE items SET price = %s"):
             price, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("price", price),
             )
 
-        if sql.startswith("UPDATE items SET quantity = quantity + %s") and "warehouse_id = %s" in sql:
+        if (
+            sql.startswith("UPDATE items SET quantity = quantity + %s")
+            and "warehouse_id = %s" in sql
+        ):
             delta, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", r["quantity"] + delta),
             )
 
@@ -260,6 +321,18 @@ class FakeDB:
                 lambda r: r["sku"] == sku and r["tenant_id"] == tenant_id,
                 lambda r: r.__setitem__("quantity", r["quantity"] + delta),
             )
+
+        if sql.startswith("INSERT INTO item_updates"):
+            sku, tenant_id, field, old_value, new_value, created_at = params
+            self.add_item_update(
+                sku=sku,
+                tenant_id=tenant_id,
+                field=field,
+                old_value=old_value,
+                new_value=new_value,
+                created_at=created_at,
+            )
+            return 1
 
         if sql.startswith("DELETE FROM reservations"):
             order_id, tenant_id = params
@@ -282,7 +355,9 @@ class FakeDB:
             item_id, tenant_id = params
             before = len(self.items)
             self.items = [
-                r for r in self.items if not (r["id"] == item_id and r["tenant_id"] == tenant_id)
+                r
+                for r in self.items
+                if not (r["id"] == item_id and r["tenant_id"] == tenant_id)
             ]
             return before - len(self.items)
 
