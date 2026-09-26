@@ -36,7 +36,9 @@ def test_delete_item_not_found(client, fake_db):
 
 
 def test_update_item(client, fake_db):
-    row = fake_db.add_item(sku="A", name="old", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    row = fake_db.add_item(
+        sku="A", name="old", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
+    )
     resp = client.post(
         f"/admin/items/{row['id']}/update",
         json={"name": "new"},
@@ -81,7 +83,9 @@ def test_bulk_adjust_invalidates_the_read_cache_for_its_warehouse(client, fake_d
     )
     assert resp.status_code == 200
 
-    after = client.get("/items/A/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    after = client.get(
+        "/items/A/stock", params={"warehouse_id": "w1"}, headers=TENANT_A
+    )
     assert after.json()["quantity"] == 6
 
 
@@ -91,7 +95,11 @@ def test_bulk_adjust_does_not_invalidate_a_different_tenants_cache(client, fake_
     fake_db.add_item(sku="A", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
     fake_db.add_item(sku="A", warehouse_id="w1", quantity=42, tenant_id="tenant-b")
 
-    warm = client.get("/items/A/stock", params={"warehouse_id": "w1"}, headers={"X-Tenant-Id": "tenant-b"})
+    warm = client.get(
+        "/items/A/stock",
+        params={"warehouse_id": "w1"},
+        headers={"X-Tenant-Id": "tenant-b"},
+    )
     assert warm.json()["quantity"] == 42
 
     resp = client.post(
@@ -101,5 +109,9 @@ def test_bulk_adjust_does_not_invalidate_a_different_tenants_cache(client, fake_
     )
     assert resp.status_code == 200
 
-    still_cached = client.get("/items/A/stock", params={"warehouse_id": "w1"}, headers={"X-Tenant-Id": "tenant-b"})
+    still_cached = client.get(
+        "/items/A/stock",
+        params={"warehouse_id": "w1"},
+        headers={"X-Tenant-Id": "tenant-b"},
+    )
     assert still_cached.json()["quantity"] == 42
