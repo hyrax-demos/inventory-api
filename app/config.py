@@ -3,6 +3,7 @@
 All sensitive values are read from the environment. The service refuses to
 boot in production if required secrets are missing (see ``require``).
 """
+
 import os
 
 
@@ -43,3 +44,6 @@ PROVIDER_ALLOWED_HOSTS = frozenset(
     ).split(",")
     if h.strip()
 )
+
+# Service version reported by the health detail endpoint.
+VERSION = _get("APP_VERSION", "0.1.0")

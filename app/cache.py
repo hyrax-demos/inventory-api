@@ -4,6 +4,7 @@ Stock and price reads dominate traffic and the underlying rows change slowly,
 so we memoize them for a few seconds to take load off Postgres. Entries expire
 on read once they pass their TTL.
 """
+
 import time
 
 # key -> (expires_at_monotonic, value)
@@ -33,6 +34,16 @@ def put(key: str, value, ttl: float = DEFAULT_TTL) -> None:
 
 def invalidate(key: str) -> None:
     _store.pop(key, None)
+
+
+def live_count() -> int:
+    """Number of entries that have not yet passed their TTL.
+
+    Read-only: expired entries are counted out but not evicted, so calling
+    this (e.g. from a health probe) never mutates the cache.
+    """
+    now = _now()
+    return sum(1 for expires_at, _ in list(_store.values()) if now < expires_at)
 
 
 def stock_key(sku: str) -> str:
