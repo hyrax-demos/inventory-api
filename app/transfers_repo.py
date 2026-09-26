@@ -171,3 +171,27 @@ def insert_movement(
         "VALUES (%s, %s, %s, %s, %s, %s, now())",
         (tenant_id, sku, warehouse_id, delta, reason, transfer_id),
     )
+
+
+def warehouse_exists(conn, tenant_id: str, warehouse_id: str) -> bool:
+    """True if the tenant has any stock row in ``warehouse_id``.
+
+    There is no warehouses table; a warehouse "exists" for a tenant when
+    that tenant has at least one stock row there.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM items WHERE tenant_id = %s AND warehouse_id = %s LIMIT 1",
+        (tenant_id, warehouse_id),
+    )
+    return cur.fetchone() is not None
+
+
+def sku_exists(conn, tenant_id: str, sku: str) -> bool:
+    """True if the tenant has any stock row for ``sku`` (no skus table)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM items WHERE tenant_id = %s AND sku = %s LIMIT 1",
+        (tenant_id, sku),
+    )
+    return cur.fetchone() is not None
