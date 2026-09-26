@@ -126,3 +126,51 @@ def test_reserve_stock_missing_item(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 404
+
+
+def test_get_stock_cache_scoped_by_warehouse(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=9, tenant_id="tenant-a")
+    r1 = client.get(
+        "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A
+    )
+    r2 = client.get(
+        "/items/WIDGET/stock", params={"warehouse_id": "w2"}, headers=TENANT_A
+    )
+    assert r1.json()["quantity"] == 5
+    assert r2.json()["quantity"] == 9
+
+
+def test_get_stock_cache_scoped_by_tenant(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    resp = client.get(
+        "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_B
+    )
+    assert resp.status_code == 404
+
+
+def test_reserve_stock_invalidates_cached_stock(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    assert (
+        client.get(
+            "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A
+        ).json()["quantity"]
+        == 10
+    )
+    client.post(
+        "/items/reserve",
+        json={
+            "sku": "WIDGET",
+            "warehouse_id": "w1",
+            "quantity": 3,
+            "order_id": "order-1",
+        },
+        headers=TENANT_A,
+    )
+    assert (
+        client.get(
+            "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A
+        ).json()["quantity"]
+        == 7
+    )

@@ -41,3 +41,28 @@ def test_release_reservation_happy_path(client, fake_db):
 def test_release_reservation_not_found(client, fake_db):
     resp = client.post("/reservations/does-not-exist/release", headers={"X-Tenant-Id": "tenant-a"})
     assert resp.status_code == 404
+
+
+def test_release_reservation_invalidates_cached_stock(client, fake_db):
+    hdr = {"X-Tenant-Id": "tenant-a"}
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    assert (
+        client.get(
+            "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=hdr
+        ).json()["quantity"]
+        == 5
+    )
+    client.post("/reservations/order-1/release", headers=hdr)
+    assert (
+        client.get(
+            "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=hdr
+        ).json()["quantity"]
+        == 8
+    )
