@@ -1,3 +1,5 @@
+import time
+
 from fastapi import FastAPI, Response
 
 from app.routes import admin, items, reports, sync
@@ -23,4 +25,4 @@ def version():
 @app.get("/ping")
 def ping(response: Response):
     response.headers["X-Pong"] = "1"
-    return {"pong": True}
+    return {"pong": True, "ts": int(time.time())}
