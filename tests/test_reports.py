@@ -1,5 +1,10 @@
 from datetime import datetime
 
+import pytest
+
+from app import db as db_module
+from app.routes import reports as reports_routes
+
 TENANT_A = {"X-Tenant-Id": "tenant-a"}
 
 
@@ -178,3 +183,183 @@ def test_reserved_value_other_tenant_excludes_foreign_reservations(client, fake_
     resp = client.get("/reports/reserved-value", headers=TENANT_B)
     assert resp.status_code == 200
     assert resp.json()["lines"] == []
+
+
+# -- import_snapshot atomicity ------------------------------------------------
+#
+# The shared FakeDB.transaction() has no rollback semantics, so these tests
+# drive the *real* app.db.transaction() over a fake connection at the lowest
+# layer (app.db.get_connection): writes are buffered and only applied to the
+# FakeDB store on commit(), and discarded on rollback().
+
+
+class _BufferingConnection:
+    def __init__(self, fake_db, fail_on_write=None):
+        self._fake_db = fake_db
+        self._fail_on_write = fail_on_write
+        self._pending: list[tuple] = []
+        self.commits = 0
+        self.rollbacks = 0
+        self.closed = False
+
+    def cursor(self, cursor_factory=None):
+        return _BufferingCursor(self)
+
+    def commit(self):
+        for sql, params in self._pending:
+            self._fake_db.execute(sql, params)
+        self._pending.clear()
+        self.commits += 1
+
+    def rollback(self):
+        self._pending.clear()
+        self.rollbacks += 1
+
+    def close(self):
+        self.closed = True
+
+
+class _BufferingCursor:
+    def __init__(self, conn):
+        self._conn = conn
+        self.rowcount = 0
+
+    def execute(self, sql, params=()):
+        conn = self._conn
+        if (
+            conn._fail_on_write is not None
+            and len(conn._pending) + 1 == conn._fail_on_write
+        ):
+            raise RuntimeError("simulated write failure")
+        conn._pending.append((sql, params))
+        self.rowcount = 1
+
+
+@pytest.fixture
+def txn_conns(fake_db, monkeypatch):
+    """Route import_snapshot through the real app.db.transaction() backed by
+    buffering fake connections. Returns (connections list, configure fn)."""
+    conns: list[_BufferingConnection] = []
+    opts = {"fail_on_write": None}
+
+    def _get_connection():
+        conn = _BufferingConnection(fake_db, fail_on_write=opts["fail_on_write"])
+        conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(db_module, "get_connection", _get_connection)
+    monkeypatch.setattr(reports_routes, "transaction", db_module.transaction)
+    # Any per-entry committing write would bypass the transaction; fail loudly.
+    monkeypatch.setattr(
+        reports_routes,
+        "execute",
+        lambda *a, **k: pytest.fail("import_snapshot must not use per-call execute()"),
+        raising=False,
+    )
+    return conns, opts
+
+
+def _seed_three(fake_db):
+    for sku in ("A", "B", "C"):
+        fake_db.add_item(sku=sku, warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+
+
+def _quantities(fake_db):
+    return {r["sku"]: r["quantity"] for r in fake_db.items}
+
+
+def test_import_snapshot_malformed_last_entry_writes_nothing(
+    client, fake_db, txn_conns
+):
+    conns, _ = txn_conns
+    _seed_three(fake_db)
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1"},  # missing quantity
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": "malformed snapshot entry"}
+    assert _quantities(fake_db) == {"A": 1, "B": 1, "C": 1}
+    assert all(c.commits == 0 for c in conns)
+
+
+def test_import_snapshot_malformed_middle_entry_writes_nothing(
+    client, fake_db, txn_conns
+):
+    conns, _ = txn_conns
+    _seed_three(fake_db)
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": "not-a-number"},
+                {"sku": "C", "warehouse_id": "w1", "quantity": 30},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": "malformed snapshot entry"}
+    assert _quantities(fake_db) == {"A": 1, "B": 1, "C": 1}
+    assert all(c.commits == 0 for c in conns)
+
+
+def test_import_snapshot_write_failure_partway_rolls_back(client, fake_db, txn_conns):
+    conns, opts = txn_conns
+    opts["fail_on_write"] = 2
+    _seed_three(fake_db)
+    failing_client = type(client)(client.app, raise_server_exceptions=False)
+    resp = failing_client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": 30},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code >= 500
+    assert _quantities(fake_db) == {"A": 1, "B": 1, "C": 1}
+    assert len(conns) == 1
+    assert conns[0].commits == 0
+    assert conns[0].rollbacks == 1
+    assert conns[0].closed
+
+
+def test_import_snapshot_valid_multi_entry_applies_all(client, fake_db, txn_conns):
+    conns, _ = txn_conns
+    _seed_three(fake_db)
+    # Another tenant's row at the same SKU/warehouse must be untouched.
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=7, tenant_id="tenant-b")
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": 30},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"items": 3, "snapshot": '{"received": 3}'}
+    a_rows = {
+        r["sku"]: r["quantity"] for r in fake_db.items if r["tenant_id"] == "tenant-a"
+    }
+    assert a_rows == {"A": 10, "B": 20, "C": 30}
+    b_row = next(r for r in fake_db.items if r["tenant_id"] == "tenant-b")
+    assert b_row["quantity"] == 7
+    assert len(conns) == 1
+    assert conns[0].commits == 1
+    assert conns[0].rollbacks == 0
