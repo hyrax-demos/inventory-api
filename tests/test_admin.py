@@ -36,7 +36,9 @@ def test_delete_item_not_found(client, fake_db):
 
 
 def test_update_item(client, fake_db):
-    row = fake_db.add_item(sku="A", name="old", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    row = fake_db.add_item(
+        sku="A", name="old", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
+    )
     resp = client.post(
         f"/admin/items/{row['id']}/update",
         json={"name": "new"},
@@ -72,12 +74,22 @@ def test_bulk_adjust_is_reflected_on_next_stock_read(client, fake_db):
     fake_db.add_item(sku="A", warehouse_id="w1", quantity=7, tenant_id="tenant-b")
     for wh in ("w1", "w2"):
         client.get("/items/A/stock", params={"warehouse_id": wh}, headers=TENANT_A)
-    client.get("/items/A/stock", params={"warehouse_id": "w1"}, headers={"X-Tenant-Id": "tenant-b"})
-    resp = client.post("/admin/items/bulk-adjust", json=[{"sku": "A", "delta": 5}], headers=TENANT_A)
+    client.get(
+        "/items/A/stock",
+        params={"warehouse_id": "w1"},
+        headers={"X-Tenant-Id": "tenant-b"},
+    )
+    resp = client.post(
+        "/admin/items/bulk-adjust", json=[{"sku": "A", "delta": 5}], headers=TENANT_A
+    )
     assert resp.status_code == 200
     w1 = client.get("/items/A/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
     w2 = client.get("/items/A/stock", params={"warehouse_id": "w2"}, headers=TENANT_A)
-    other = client.get("/items/A/stock", params={"warehouse_id": "w1"}, headers={"X-Tenant-Id": "tenant-b"})
+    other = client.get(
+        "/items/A/stock",
+        params={"warehouse_id": "w1"},
+        headers={"X-Tenant-Id": "tenant-b"},
+    )
     assert w1.json()["quantity"] == 6
     assert w2.json()["quantity"] == 7
     assert other.json()["quantity"] == 7
