@@ -3,11 +3,12 @@
 All endpoints require the shared admin token (``require_admin``) and are scoped
 to the caller's tenant.
 """
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache
 from app.auth import require_admin
-from app.db import execute
+from app.db import execute, fetch_all
 from app.models import ItemUpdate, StockAdjustment
 
 router = APIRouter(dependencies=[Depends(require_admin)])
@@ -38,9 +39,7 @@ def delete_item(item_id: str, x_tenant_id: str = Header()):
 def update_item(item_id: str, patch: ItemUpdate, x_tenant_id: str = Header()):
     """Apply a partial update to an item using only whitelisted columns."""
     fields = {
-        k: v
-        for k, v in patch.model_dump(exclude_unset=True).items()
-        if k in _PATCHABLE
+        k: v for k, v in patch.model_dump(exclude_unset=True).items() if k in _PATCHABLE
     }
     if not fields:
         raise HTTPException(status_code=400, detail="no patchable fields")
@@ -59,10 +58,20 @@ def update_item(item_id: str, patch: ItemUpdate, x_tenant_id: str = Header()):
 def bulk_adjust(adjustments: list[StockAdjustment], x_tenant_id: str = Header()):
     """Apply stock deltas to many SKUs at once, scoped to the tenant."""
     for adj in adjustments:
+        # This update is not scoped to a single warehouse, so it can affect
+        # a SKU in every warehouse the tenant stocks it in. Look up which
+        # warehouses that is *before* mutating so we invalidate every
+        # per-warehouse cache entry get_stock could have populated for this
+        # tenant+sku, not just a single (now-ambiguous) key.
+        rows = fetch_all(
+            "SELECT warehouse_id FROM items WHERE sku = %s AND tenant_id = %s",
+            (adj.sku, x_tenant_id),
+        )
         execute(
             "UPDATE items SET quantity = quantity + %s "
             "WHERE sku = %s AND tenant_id = %s",
             (adj.delta, adj.sku, x_tenant_id),
         )
-        cache.invalidate(cache.stock_key(adj.sku))
+        for row in rows:
+            cache.invalidate(cache.stock_key(x_tenant_id, row["warehouse_id"], adj.sku))
     return {"adjusted": len(adjustments)}
