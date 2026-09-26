@@ -6,8 +6,12 @@ TENANT_A = {"X-Tenant-Id": "tenant-a"}
 
 
 def test_low_stock_report_happy_path(client, fake_db):
-    fake_db.add_item(sku="A", name="a", warehouse_id="w1", quantity=2, tenant_id="tenant-a")
-    fake_db.add_item(sku="B", name="b", warehouse_id="w1", quantity=99, tenant_id="tenant-a")
+    fake_db.add_item(
+        sku="A", name="a", warehouse_id="w1", quantity=2, tenant_id="tenant-a"
+    )
+    fake_db.add_item(
+        sku="B", name="b", warehouse_id="w1", quantity=99, tenant_id="tenant-a"
+    )
     resp = client.get("/reports/low-stock", params={"threshold": 10}, headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
@@ -15,8 +19,12 @@ def test_low_stock_report_happy_path(client, fake_db):
 
 
 def test_low_stock_report_scoped_to_tenant(client, fake_db):
-    fake_db.add_item(sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
-    fake_db.add_item(sku="B", name="b", warehouse_id="w1", quantity=1, tenant_id="tenant-b")
+    fake_db.add_item(
+        sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
+    )
+    fake_db.add_item(
+        sku="B", name="b", warehouse_id="w1", quantity=1, tenant_id="tenant-b"
+    )
     resp = client.get("/reports/low-stock", headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
@@ -25,7 +33,11 @@ def test_low_stock_report_scoped_to_tenant(client, fake_db):
 
 def test_todays_movements_returns_recent_entries(client, fake_db):
     fake_db.add_movement(
-        sku="WIDGET", warehouse_id="w1", delta=-2, created_at=datetime.now(timezone.utc), tenant_id="tenant-a"
+        sku="WIDGET",
+        warehouse_id="w1",
+        delta=-2,
+        created_at=datetime.now(timezone.utc),
+        tenant_id="tenant-a",
     )
     resp = client.get("/reports/today", headers=TENANT_A)
     assert resp.status_code == 200
@@ -36,7 +48,11 @@ def test_todays_movements_returns_recent_entries(client, fake_db):
 
 def test_todays_movements_scoped_to_tenant(client, fake_db):
     fake_db.add_movement(
-        sku="WIDGET", warehouse_id="w1", delta=-2, created_at=datetime.now(timezone.utc), tenant_id="tenant-b"
+        sku="WIDGET",
+        warehouse_id="w1",
+        delta=-2,
+        created_at=datetime.now(timezone.utc),
+        tenant_id="tenant-b",
     )
     resp = client.get("/reports/today", headers=TENANT_A)
     assert resp.status_code == 200
@@ -45,8 +61,12 @@ def test_todays_movements_scoped_to_tenant(client, fake_db):
 
 
 def test_reserved_value_happy_path(client, fake_db):
-    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=100, price=2.0, tenant_id="tenant-a")
-    fake_db.add_reservation(order_id="o1", tenant_id="tenant-a", sku="WIDGET", warehouse_id="w1", quantity=3)
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=100, price=2.0, tenant_id="tenant-a"
+    )
+    fake_db.add_reservation(
+        order_id="o1", tenant_id="tenant-a", sku="WIDGET", warehouse_id="w1", quantity=3
+    )
     resp = client.get("/reports/reserved-value", headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
@@ -95,7 +115,10 @@ def test_utc_start_of_day_default_is_aware_utc_midnight():
     start = reports_routes.utc_start_of_day()
     now = datetime.now(timezone.utc)
     assert start.utcoffset() == timedelta(0)
-    assert start.date() == now.date() or start.date() == (now - timedelta(minutes=1)).date()
+    assert (
+        start.date() == now.date()
+        or start.date() == (now - timedelta(minutes=1)).date()
+    )
     assert (start.hour, start.minute, start.second, start.microsecond) == (0, 0, 0, 0)
 
 
@@ -117,11 +140,15 @@ def test_todays_movements_passes_aware_utc_boundary(client, fake_db, monkeypatch
 def test_todays_movements_excludes_yesterday_utc(client, fake_db):
     now = datetime.now(timezone.utc)
     fake_db.add_movement(
-        sku="OLD", warehouse_id="w1", delta=1,
+        sku="OLD",
+        warehouse_id="w1",
+        delta=1,
         created_at=reports_routes.utc_start_of_day(now) - timedelta(seconds=1),
         tenant_id="tenant-a",
     )
-    fake_db.add_movement(sku="NEW", warehouse_id="w1", delta=1, created_at=now, tenant_id="tenant-a")
+    fake_db.add_movement(
+        sku="NEW", warehouse_id="w1", delta=1, created_at=now, tenant_id="tenant-a"
+    )
     resp = client.get("/reports/today", headers=TENANT_A)
     skus = [m["sku"] for m in resp.json()["movements"]]
     assert "OLD" not in skus and "NEW" in skus
