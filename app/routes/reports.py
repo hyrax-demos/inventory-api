@@ -69,6 +69,7 @@ def reserved_value(tenant_id: str = Depends(require_tenant)):
         "FROM reservations r "
         "JOIN items i "
         "  ON i.sku = r.sku AND i.warehouse_id = r.warehouse_id "
+        "  AND i.tenant_id = r.tenant_id "
         "WHERE r.tenant_id = %s "
         "GROUP BY r.sku, r.warehouse_id "
         "ORDER BY reserved_value DESC",

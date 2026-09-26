@@ -127,6 +127,36 @@ def test_reserved_value_happy_path(client, fake_db):
     assert line["reserved_qty"] == 3
 
 
+def test_reserved_value_uses_own_tenant_item_price(client, fake_db):
+    # Two tenants stock the same SKU in the same warehouse at different prices.
+    # The other tenant's row is seeded first so an unscoped join would pick it.
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=100, price=50.0, tenant_id="tenant-b"
+    )
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=100, price=2.0, tenant_id="tenant-a"
+    )
+    fake_db.add_reservation(
+        order_id="o1", tenant_id="tenant-a", sku="WIDGET", warehouse_id="w1", quantity=3
+    )
+    fake_db.add_reservation(
+        order_id="o2", tenant_id="tenant-b", sku="WIDGET", warehouse_id="w1", quantity=7
+    )
+
+    resp = client.get("/reports/reserved-value", headers=TENANT_A)
+    assert resp.status_code == 200
+    (line,) = resp.json()["lines"]
+    assert line["sku"] == "WIDGET"
+    assert line["reserved_qty"] == 3
+    assert line["reserved_value"] == pytest.approx(6.0)
+
+    resp_b = client.get("/reports/reserved-value", headers={"X-Tenant-Id": "tenant-b"})
+    assert resp_b.status_code == 200
+    (line_b,) = resp_b.json()["lines"]
+    assert line_b["reserved_qty"] == 7
+    assert line_b["reserved_value"] == pytest.approx(350.0)
+
+
 def test_import_snapshot_happy_path(client, fake_db):
     fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
     resp = client.post(
