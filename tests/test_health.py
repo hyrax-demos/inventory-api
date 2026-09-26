@@ -22,3 +22,9 @@ def test_ping(client):
     assert body["pong"] is True
     assert isinstance(body["ts"], int)
     assert resp.headers["X-Pong"] == "1"
+
+
+def test_debug_ok(client):
+    resp = client.get("/debug/ok")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}

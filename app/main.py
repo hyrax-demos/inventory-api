@@ -26,3 +26,8 @@ def version():
 def ping(response: Response):
     response.headers["X-Pong"] = "1"
     return {"pong": True, "ts": int(time.time())}
+
+
+@app.get("/debug/ok")
+def debug_ok():
+    return {"ok": True}
