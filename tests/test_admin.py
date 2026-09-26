@@ -36,7 +36,9 @@ def test_delete_item_not_found(client, fake_db):
 
 
 def test_update_item(client, fake_db):
-    row = fake_db.add_item(sku="A", name="old", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    row = fake_db.add_item(
+        sku="A", name="old", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
+    )
     resp = client.post(
         f"/admin/items/{row['id']}/update",
         json={"name": "new"},
@@ -64,3 +66,33 @@ def test_bulk_adjust(client, fake_db):
     assert resp.json()["adjusted"] == 2
     by_sku = {r["sku"]: r["quantity"] for r in fake_db.items}
     assert by_sku == {"A": 6, "B": 0}
+
+
+def test_bulk_adjust_invalidates_stock_cache_in_every_warehouse(client, fake_db):
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    fake_db.add_item(sku="A", warehouse_id="w2", quantity=2, tenant_id="tenant-a")
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=100, tenant_id="tenant-b")
+
+    def stock(wh, tenant):
+        resp = client.get(
+            "/items/A/stock",
+            params={"warehouse_id": wh},
+            headers={"X-Tenant-Id": tenant},
+        )
+        assert resp.status_code == 200
+        return resp.json()["quantity"]
+
+    assert (
+        stock("w1", "tenant-a"),
+        stock("w2", "tenant-a"),
+        stock("w1", "tenant-b"),
+    ) == (1, 2, 100)
+    resp = client.post(
+        "/admin/items/bulk-adjust", json=[{"sku": "A", "delta": 5}], headers=TENANT_A
+    )
+    assert resp.status_code == 200
+    assert (
+        stock("w1", "tenant-a"),
+        stock("w2", "tenant-a"),
+        stock("w1", "tenant-b"),
+    ) == (6, 7, 100)
