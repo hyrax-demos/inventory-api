@@ -4,7 +4,9 @@ Stock and price reads dominate traffic and the underlying rows change slowly,
 so we memoize them for a few seconds to take load off Postgres. Entries expire
 on read once they pass their TTL.
 """
+
 import time
+from urllib.parse import quote
 
 # key -> (expires_at_monotonic, value)
 _store: dict[str, tuple[float, object]] = {}
@@ -35,9 +37,33 @@ def invalidate(key: str) -> None:
     _store.pop(key, None)
 
 
-def stock_key(sku: str) -> str:
-    """Cache key for a SKU's stock snapshot."""
-    return f"stock:{sku}"
+def _part(value: str) -> str:
+    # Percent-encode every key component (including ":") so distinct
+    # (tenant, sku, warehouse) tuples can never collapse onto the same key.
+    return quote(str(value), safe="")
+
+
+def _stock_sku_prefix(tenant_id: str, sku: str) -> str:
+    return f"stock:{_part(tenant_id)}:{_part(sku)}:"
+
+
+def stock_key(tenant_id: str, warehouse_id: str, sku: str) -> str:
+    """Cache key for a SKU's stock snapshot in one tenant's warehouse.
+
+    Stock is only meaningful per tenant + warehouse + SKU; keying on less
+    than that leaks one warehouse's (or one tenant's) quantity into another.
+    """
+    return f"{_stock_sku_prefix(tenant_id, sku)}{_part(warehouse_id)}"
+
+
+def invalidate_stock_for_sku(tenant_id: str, sku: str) -> None:
+    """Drop cached stock for a tenant's SKU across every warehouse.
+
+    For writes that touch a SKU without naming a warehouse.
+    """
+    prefix = _stock_sku_prefix(tenant_id, sku)
+    for key in [k for k in _store if k.startswith(prefix)]:
+        _store.pop(key, None)
 
 
 def price_key(sku: str, warehouse_id: str) -> str:
