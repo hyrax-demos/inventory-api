@@ -1,23 +1,60 @@
 """Report generation and snapshot import."""
+
 import json
 from datetime import datetime
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Query
 
 from app.db import execute, fetch_all
+from app.models import LowStockPage
 
 router = APIRouter()
 
 
+def _encode_low_stock_cursor(row: dict) -> str:
+    return f"{row['quantity']}:{row['id']}"
+
+
+def _decode_low_stock_cursor(cursor: str) -> tuple[int, str]:
+    quantity, sep, item_id = cursor.partition(":")
+    try:
+        if not sep or not item_id:
+            raise ValueError
+        return int(quantity), item_id
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid cursor")
+
+
 @router.get("/reports/low-stock")
-def low_stock_report(threshold: int = 10, x_tenant_id: str = Header()):
-    """Items at or below the reorder threshold, scoped to the tenant."""
+def low_stock_report(
+    threshold: int = 10,
+    limit: int = Query(default=50, ge=1),
+    cursor: str = "",
+    x_tenant_id: str = Header(),
+):
+    """Items at or below the reorder threshold, scoped to the tenant.
+
+    Ordered by quantity ascending (most urgent first) with id as a tiebreak,
+    and keyset-paginated on ``(quantity, id)`` like ``/items``: ``next_cursor``
+    identifies the first row of the next page.
+    """
+    clauses = ["tenant_id = %s", "quantity <= %s"]
+    params: list = [x_tenant_id, threshold]
+    if cursor:
+        clauses.append("(quantity, id) >= (%s, %s)")
+        params.extend(_decode_low_stock_cursor(cursor))
+    where = " AND ".join(clauses)
+    params.append(limit + 1)
     rows = fetch_all(
-        "SELECT sku, name, warehouse_id, quantity FROM items "
-        "WHERE tenant_id = %s AND quantity <= %s ORDER BY quantity ASC",
-        (x_tenant_id, threshold),
+        "SELECT id, sku, name, warehouse_id, quantity FROM items "
+        f"WHERE {where} ORDER BY quantity ASC, id ASC LIMIT %s",
+        tuple(params),
     )
-    return {"threshold": threshold, "items": rows}
+    next_cursor = None
+    if len(rows) > limit:
+        next_cursor = _encode_low_stock_cursor(rows[limit])
+        rows = rows[:limit]
+    return LowStockPage(threshold=threshold, items=rows, next_cursor=next_cursor)
 
 
 @router.get("/reports/today")
@@ -27,9 +64,7 @@ def todays_movements(x_tenant_id: str = Header()):
     ``movements.created_at`` is stored in UTC; we report everything from the
     start of the current day onward.
     """
-    start_of_day = datetime.now().replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    start_of_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     rows = fetch_all(
         "SELECT sku, warehouse_id, delta, created_at FROM movements "
         "WHERE tenant_id = %s AND created_at >= %s ORDER BY created_at ASC",

@@ -37,3 +37,9 @@ class Page(BaseModel):
 
     items: list[dict]
     next_cursor: str | None = None
+
+
+class LowStockPage(Page):
+    """A page of the low-stock report, echoing the threshold it was run at."""
+
+    threshold: int
