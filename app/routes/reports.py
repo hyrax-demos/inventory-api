@@ -1,45 +1,64 @@
 """Report generation and snapshot import."""
+
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from app import cache
 from app.db import execute, fetch_all
+from app.deps import require_tenant
 
 router = APIRouter()
 
 
+def _utcnow() -> datetime:
+    """Current time as a timezone-aware UTC datetime (patchable clock seam)."""
+    return datetime.now(timezone.utc)
+
+
+def _start_of_utc_day(now: datetime) -> datetime:
+    """Midnight UTC of the day containing ``now``, as an aware datetime.
+
+    ``now`` must be timezone-aware; a naive value is ambiguous against the
+    UTC ``created_at`` column and is rejected.
+    """
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    return now.astimezone(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+
 @router.get("/reports/low-stock")
-def low_stock_report(threshold: int = 10, x_tenant_id: str = Header()):
+def low_stock_report(threshold: int = 10, tenant_id: str = Depends(require_tenant)):
     """Items at or below the reorder threshold, scoped to the tenant."""
     rows = fetch_all(
         "SELECT sku, name, warehouse_id, quantity FROM items "
         "WHERE tenant_id = %s AND quantity <= %s ORDER BY quantity ASC",
-        (x_tenant_id, threshold),
+        (tenant_id, threshold),
     )
     return {"threshold": threshold, "items": rows}
 
 
 @router.get("/reports/today")
-def todays_movements(x_tenant_id: str = Header()):
+def todays_movements(tenant_id: str = Depends(require_tenant)):
     """Stock movements recorded so far today.
 
     ``movements.created_at`` is stored in UTC; we report everything from the
     start of the current day onward.
     """
-    start_of_day = datetime.now().replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    start_of_day = _start_of_utc_day(_utcnow())
     rows = fetch_all(
         "SELECT sku, warehouse_id, delta, created_at FROM movements "
         "WHERE tenant_id = %s AND created_at >= %s ORDER BY created_at ASC",
-        (x_tenant_id, start_of_day),
+        (tenant_id, start_of_day),
     )
     return {"date": start_of_day.date().isoformat(), "movements": rows}
 
 
 @router.get("/reports/reserved-value")
-def reserved_value(x_tenant_id: str = Header()):
+def reserved_value(tenant_id: str = Depends(require_tenant)):
     """Total dollar value of stock currently reserved, by SKU.
 
     Joins open reservations to their item rows to price each reservation.
@@ -51,16 +70,17 @@ def reserved_value(x_tenant_id: str = Header()):
         "FROM reservations r "
         "JOIN items i "
         "  ON i.sku = r.sku AND i.warehouse_id = r.warehouse_id "
+        "  AND i.tenant_id = r.tenant_id "
         "WHERE r.tenant_id = %s "
         "GROUP BY r.sku, r.warehouse_id "
         "ORDER BY reserved_value DESC",
-        (x_tenant_id,),
+        (tenant_id,),
     )
     return {"lines": rows}
 
 
 @router.post("/reports/import")
-async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
+async def import_snapshot(payload: dict, tenant_id: str = Depends(require_tenant)):
     """Bulk-import a stock snapshot.
 
     Body: {"items": [{"sku": "ABC", "warehouse_id": "w1", "quantity": 5}, ...]}
@@ -79,7 +99,9 @@ async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
         execute(
             "UPDATE items SET quantity = %s "
             "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-            (quantity, sku, warehouse_id, x_tenant_id),
+            (quantity, sku, warehouse_id, tenant_id),
         )
+        cache.invalidate(cache.stock_key(tenant_id, warehouse_id, sku))
+        cache.invalidate_item(tenant_id, sku)
         count += 1
     return {"items": count, "snapshot": json.dumps({"received": count})}

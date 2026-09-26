@@ -1,28 +1,29 @@
 """Inventory item lookup, search, and stock reservation."""
-from fastapi import APIRouter, Header, HTTPException
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app import cache
 from app.db import execute, fetch_all, fetch_one
+from app.deps import require_tenant
 from app.models import Page, ReservationRequest
 
 router = APIRouter()
 
 
-def _tenant(x_tenant_id: str = Header()) -> str:
-    if not x_tenant_id:
-        raise HTTPException(status_code=400, detail="missing tenant")
-    return x_tenant_id
-
-
 @router.get("/items/{sku}")
-def get_item(sku: str, x_tenant_id: str = Header()):
-    tenant_id = _tenant(x_tenant_id)
+def get_item(sku: str, tenant_id: str = Depends(require_tenant)):
+    """Return the tenant's item row for a SKU (cached per tenant and SKU)."""
+    key = cache.item_key(tenant_id, sku)
+    cached = cache.get(key)
+    if cached is not None:
+        return dict(cached)
     row = fetch_one(
         "SELECT * FROM items WHERE sku = %s AND tenant_id = %s",
         (sku, tenant_id),
     )
     if row is None:
         raise HTTPException(status_code=404, detail="not found")
+    cache.put(key, dict(row))
     return row
 
 
@@ -30,12 +31,11 @@ def get_item(sku: str, x_tenant_id: str = Header()):
 def search_items(
     warehouse_id: str = "",
     q: str = "",
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=200),
     cursor: str = "",
-    x_tenant_id: str = Header(),
+    tenant_id: str = Depends(require_tenant),
 ):
     """Search items, newest id last, with keyset pagination by id."""
-    tenant_id = _tenant(x_tenant_id)
     clauses = ["tenant_id = %s"]
     params: list = [tenant_id]
     if warehouse_id:
@@ -62,10 +62,9 @@ def search_items(
 
 
 @router.get("/items/{sku}/stock")
-def get_stock(sku: str, warehouse_id: str, x_tenant_id: str = Header()):
+def get_stock(sku: str, warehouse_id: str, tenant_id: str = Depends(require_tenant)):
     """Return the on-hand quantity for a SKU at a warehouse (cached)."""
-    tenant_id = _tenant(x_tenant_id)
-    key = cache.stock_key(sku)
+    key = cache.stock_key(tenant_id, warehouse_id, sku)
     cached = cache.get(key)
     if cached is not None:
         return {"sku": sku, "warehouse_id": warehouse_id, "quantity": cached}
@@ -82,13 +81,12 @@ def get_stock(sku: str, warehouse_id: str, x_tenant_id: str = Header()):
 
 
 @router.post("/items/reserve")
-def reserve_stock(req: ReservationRequest, x_tenant_id: str = Header()):
+def reserve_stock(req: ReservationRequest, tenant_id: str = Depends(require_tenant)):
     """Reserve stock for an order, decrementing on-hand quantity.
 
     Reservations are idempotent per order_id: a repeated call for an order we
     already reserved is a no-op.
     """
-    tenant_id = _tenant(x_tenant_id)
 
     existing = fetch_one(
         "SELECT 1 FROM reservations WHERE order_id = %s AND tenant_id = %s",
@@ -117,5 +115,6 @@ def reserve_stock(req: ReservationRequest, x_tenant_id: str = Header()):
         "VALUES (%s, %s, %s, %s, %s)",
         (req.order_id, tenant_id, req.sku, req.warehouse_id, req.quantity),
     )
-    cache.invalidate(cache.stock_key(req.sku))
+    cache.invalidate(cache.stock_key(tenant_id, req.warehouse_id, req.sku))
+    cache.invalidate_item(tenant_id, req.sku)
     return {"order_id": req.order_id, "status": "reserved"}
