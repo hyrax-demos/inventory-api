@@ -1,9 +1,11 @@
 """Inventory item lookup, search, and stock reservation."""
+
 from fastapi import APIRouter, Header, HTTPException
 
 from app import cache
-from app.db import execute, fetch_all, fetch_one
 from app.models import Page, ReservationRequest
+from app.repositories import items as items_repo
+from app.repositories import reservations as reservations_repo
 
 router = APIRouter()
 
@@ -17,10 +19,7 @@ def _tenant(x_tenant_id: str = Header()) -> str:
 @router.get("/items/{sku}")
 def get_item(sku: str, x_tenant_id: str = Header()):
     tenant_id = _tenant(x_tenant_id)
-    row = fetch_one(
-        "SELECT * FROM items WHERE sku = %s AND tenant_id = %s",
-        (sku, tenant_id),
-    )
+    row = items_repo.get_by_sku(sku, tenant_id)
     if row is None:
         raise HTTPException(status_code=404, detail="not found")
     return row
@@ -36,23 +35,14 @@ def search_items(
 ):
     """Search items, newest id last, with keyset pagination by id."""
     tenant_id = _tenant(x_tenant_id)
-    clauses = ["tenant_id = %s"]
-    params: list = [tenant_id]
-    if warehouse_id:
-        clauses.append("warehouse_id = %s")
-        params.append(warehouse_id)
-    if q:
-        clauses.append("name ILIKE %s")
-        params.append(f"%{q}%")
-    if cursor:
-        # Continue after the last id we returned on the previous page.
-        clauses.append("id >= %s")
-        params.append(cursor)
-    where = " AND ".join(clauses)
-    params.append(limit + 1)
-    rows = fetch_all(
-        f"SELECT * FROM items WHERE {where} ORDER BY id ASC LIMIT %s",
-        tuple(params),
+    # Fetch one extra row to learn whether another page follows; a cursor
+    # continues from the last id we returned on the previous page.
+    rows = items_repo.search(
+        tenant_id,
+        limit + 1,
+        warehouse_id=warehouse_id,
+        q=q,
+        cursor=cursor,
     )
     next_cursor = None
     if len(rows) > limit:
@@ -69,14 +59,9 @@ def get_stock(sku: str, warehouse_id: str, x_tenant_id: str = Header()):
     cached = cache.get(key)
     if cached is not None:
         return {"sku": sku, "warehouse_id": warehouse_id, "quantity": cached}
-    row = fetch_one(
-        "SELECT quantity FROM items "
-        "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-        (sku, warehouse_id, tenant_id),
-    )
-    if row is None:
+    qty = items_repo.get_quantity(sku, warehouse_id, tenant_id)
+    if qty is None:
         raise HTTPException(status_code=404, detail="not found")
-    qty = row["quantity"]
     cache.put(key, qty)
     return {"sku": sku, "warehouse_id": warehouse_id, "quantity": qty}
 
@@ -90,32 +75,18 @@ def reserve_stock(req: ReservationRequest, x_tenant_id: str = Header()):
     """
     tenant_id = _tenant(x_tenant_id)
 
-    existing = fetch_one(
-        "SELECT 1 FROM reservations WHERE order_id = %s AND tenant_id = %s",
-        (req.order_id, tenant_id),
-    )
-    if existing is not None:
+    if reservations_repo.exists(req.order_id, tenant_id):
         return {"order_id": req.order_id, "status": "already_reserved"}
 
-    row = fetch_one(
-        "SELECT quantity FROM items "
-        "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-        (req.sku, req.warehouse_id, tenant_id),
-    )
-    if row is None:
+    on_hand = items_repo.get_quantity(req.sku, req.warehouse_id, tenant_id)
+    if on_hand is None:
         raise HTTPException(status_code=404, detail="not found")
-    if row["quantity"] < req.quantity:
+    if on_hand < req.quantity:
         raise HTTPException(status_code=409, detail="insufficient stock")
 
-    execute(
-        "UPDATE items SET quantity = quantity - %s "
-        "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-        (req.quantity, req.sku, req.warehouse_id, tenant_id),
-    )
-    execute(
-        "INSERT INTO reservations (order_id, tenant_id, sku, warehouse_id, quantity) "
-        "VALUES (%s, %s, %s, %s, %s)",
-        (req.order_id, tenant_id, req.sku, req.warehouse_id, req.quantity),
+    items_repo.decrement_quantity(req.sku, req.warehouse_id, tenant_id, req.quantity)
+    reservations_repo.create(
+        req.order_id, tenant_id, req.sku, req.warehouse_id, req.quantity
     )
     cache.invalidate(cache.stock_key(req.sku))
     return {"order_id": req.order_id, "status": "reserved"}
