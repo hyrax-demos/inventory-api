@@ -1,4 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from app.routes import reports as reports_routes
 
 TENANT_A = {"X-Tenant-Id": "tenant-a"}
 
@@ -34,7 +38,7 @@ def test_todays_movements_returns_recent_entries(client, fake_db):
         sku="WIDGET",
         warehouse_id="w1",
         delta=-2,
-        created_at=datetime.now(),
+        created_at=datetime.now(timezone.utc),
         tenant_id="tenant-a",
     )
     resp = client.get("/reports/today", headers=TENANT_A)
@@ -49,13 +53,62 @@ def test_todays_movements_scoped_to_tenant(client, fake_db):
         sku="WIDGET",
         warehouse_id="w1",
         delta=-2,
-        created_at=datetime.now(),
+        created_at=datetime.now(timezone.utc),
         tenant_id="tenant-b",
     )
     resp = client.get("/reports/today", headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
     assert body["movements"] == []
+
+
+def test_todays_movements_bound_is_utc_midnight(client, fake_db, monkeypatch):
+    # 23:30 at UTC-5 on Jan 1 is 04:30 UTC on Jan 2: the report must start at
+    # UTC midnight of Jan 2, not local midnight of Jan 1.
+    frozen = datetime(2024, 1, 1, 23, 30, tzinfo=timezone(timedelta(hours=-5)))
+    monkeypatch.setattr(reports_routes, "_utcnow", lambda: frozen)
+
+    captured = []
+    real_fetch_all = fake_db.fetch_all
+
+    def spy(sql, params=()):
+        captured.append(params)
+        return real_fetch_all(sql, params)
+
+    monkeypatch.setattr(reports_routes, "fetch_all", spy)
+
+    fake_db.add_movement(
+        sku="BEFORE",
+        warehouse_id="w1",
+        delta=-1,
+        created_at=datetime(2024, 1, 1, 23, 59, tzinfo=timezone.utc),
+        tenant_id="tenant-a",
+    )
+    fake_db.add_movement(
+        sku="AFTER",
+        warehouse_id="w1",
+        delta=-1,
+        created_at=datetime(2024, 1, 2, 0, 1, tzinfo=timezone.utc),
+        tenant_id="tenant-a",
+    )
+
+    resp = client.get("/reports/today", headers=TENANT_A)
+    assert resp.status_code == 200
+
+    (params,) = captured
+    bound = params[1]
+    assert bound.tzinfo is not None
+    assert bound.utcoffset() == timedelta(0)
+    assert bound == datetime(2024, 1, 2, tzinfo=timezone.utc)
+
+    body = resp.json()
+    assert body["date"] == "2024-01-02"
+    assert [m["sku"] for m in body["movements"]] == ["AFTER"]
+
+
+def test_start_of_utc_day_rejects_naive_datetime():
+    with pytest.raises(ValueError):
+        reports_routes._start_of_utc_day(datetime(2024, 1, 1, 12, 0))  # noqa: DTZ001
 
 
 def test_reserved_value_happy_path(client, fake_db):

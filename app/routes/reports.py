@@ -1,7 +1,7 @@
 """Report generation and snapshot import."""
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -9,6 +9,24 @@ from app.db import execute, fetch_all
 from app.deps import require_tenant
 
 router = APIRouter()
+
+
+def _utcnow() -> datetime:
+    """Current time as a timezone-aware UTC datetime (patchable clock seam)."""
+    return datetime.now(timezone.utc)
+
+
+def _start_of_utc_day(now: datetime) -> datetime:
+    """Midnight UTC of the day containing ``now``, as an aware datetime.
+
+    ``now`` must be timezone-aware; a naive value is ambiguous against the
+    UTC ``created_at`` column and is rejected.
+    """
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    return now.astimezone(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
 
 
 @router.get("/reports/low-stock")
@@ -29,7 +47,7 @@ def todays_movements(tenant_id: str = Depends(require_tenant)):
     ``movements.created_at`` is stored in UTC; we report everything from the
     start of the current day onward.
     """
-    start_of_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_day = _start_of_utc_day(_utcnow())
     rows = fetch_all(
         "SELECT sku, warehouse_id, delta, created_at FROM movements "
         "WHERE tenant_id = %s AND created_at >= %s ORDER BY created_at ASC",
