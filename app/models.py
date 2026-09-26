@@ -51,3 +51,14 @@ class Transfer(BaseModel):
     destination_warehouse_id: str
     quantity: int
     created_at: datetime
+
+
+class TransferOut(BaseModel):
+    """Public representation of a transfer (tenant_id is never exposed)."""
+
+    id: str
+    sku: str
+    source_warehouse_id: str
+    destination_warehouse_id: str
+    quantity: int
+    created_at: datetime
