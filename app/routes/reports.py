@@ -1,6 +1,7 @@
 """Report generation and snapshot import."""
+
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Header, HTTPException
 
@@ -25,9 +26,11 @@ def todays_movements(x_tenant_id: str = Header()):
     """Stock movements recorded so far today.
 
     ``movements.created_at`` is stored in UTC; we report everything from the
-    start of the current day onward.
+    start of the current UTC day onward. The cutoff is computed as a
+    timezone-aware UTC midnight so the result doesn't depend on the server's
+    local timezone.
     """
-    start_of_day = datetime.now().replace(
+    start_of_day = datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
     rows = fetch_all(
