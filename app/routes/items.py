@@ -12,12 +12,18 @@ router = APIRouter()
 
 @router.get("/items/{sku}")
 def get_item(sku: str, tenant_id: str = Depends(require_tenant)):
+    """Return the tenant's item row for a SKU (cached per tenant and SKU)."""
+    key = cache.item_key(tenant_id, sku)
+    cached = cache.get(key)
+    if cached is not None:
+        return dict(cached)
     row = fetch_one(
         "SELECT * FROM items WHERE sku = %s AND tenant_id = %s",
         (sku, tenant_id),
     )
     if row is None:
         raise HTTPException(status_code=404, detail="not found")
+    cache.put(key, dict(row))
     return row
 
 
@@ -110,4 +116,5 @@ def reserve_stock(req: ReservationRequest, tenant_id: str = Depends(require_tena
         (req.order_id, tenant_id, req.sku, req.warehouse_id, req.quantity),
     )
     cache.invalidate(cache.stock_key(tenant_id, req.warehouse_id, req.sku))
+    cache.invalidate_item(tenant_id, req.sku)
     return {"order_id": req.order_id, "status": "reserved"}

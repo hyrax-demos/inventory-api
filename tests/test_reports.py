@@ -199,3 +199,32 @@ def test_import_snapshot_empty_tenant_header_is_rejected(client, fake_db):
     )
     assert resp.status_code == 400
     assert fake_db.items[0]["quantity"] == 1
+
+
+def test_import_snapshot_invalidates_item_and_stock_cache(client, fake_db):
+    from app import cache
+
+    tenant_b = {"X-Tenant-Id": "tenant-b"}
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=8, tenant_id="tenant-b")
+    stock_params = {"warehouse_id": "w1"}
+    for hdr in (TENANT_A, tenant_b):
+        client.get("/items/WIDGET", headers=hdr)
+        client.get("/items/WIDGET/stock", params=stock_params, headers=hdr)
+
+    resp = client.post(
+        "/reports/import",
+        json={"items": [{"sku": "WIDGET", "warehouse_id": "w1", "quantity": 50}]},
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+
+    assert cache.get(cache.item_key("tenant-a", "WIDGET")) is None
+    assert cache.get(cache.stock_key("tenant-a", "w1", "WIDGET")) is None
+    # the other tenant's entries are untouched
+    assert cache.get(cache.item_key("tenant-b", "WIDGET"))["quantity"] == 8
+    assert cache.get(cache.stock_key("tenant-b", "w1", "WIDGET")) == 8
+
+    assert client.get("/items/WIDGET", headers=TENANT_A).json()["quantity"] == 50
+    stock = client.get("/items/WIDGET/stock", params=stock_params, headers=TENANT_A)
+    assert stock.json()["quantity"] == 50

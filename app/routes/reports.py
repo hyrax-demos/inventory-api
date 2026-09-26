@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from app import cache
 from app.db import execute, fetch_all
 from app.deps import require_tenant
 
@@ -100,5 +101,7 @@ async def import_snapshot(payload: dict, tenant_id: str = Depends(require_tenant
             "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
             (quantity, sku, warehouse_id, tenant_id),
         )
+        cache.invalidate(cache.stock_key(tenant_id, warehouse_id, sku))
+        cache.invalidate_item(tenant_id, sku)
         count += 1
     return {"items": count, "snapshot": json.dumps({"received": count})}

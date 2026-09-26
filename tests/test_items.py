@@ -259,3 +259,74 @@ def test_stock_key_components_cannot_collide():
     assert cache.stock_key("a:b", "w", "s") != cache.stock_key("a", "b:w", "s")
     assert cache.stock_key("t", "w1", "s") != cache.stock_key("t", "w2", "s")
     assert cache.stock_key("t1", "w", "s") != cache.stock_key("t2", "w", "s")
+
+
+def test_get_item_cache_hit_skips_db(client, fake_db):
+    from app import cache
+
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=5, price=2.5, tenant_id="tenant-a"
+    )
+    first = client.get("/items/WIDGET", headers=TENANT_A)
+    assert first.status_code == 200
+    assert cache.get(cache.item_key("tenant-a", "WIDGET"))["price"] == 2.5
+
+    # Mutate the backing row out-of-band: a warm read must come from cache.
+    fake_db.items[0]["price"] = 99.0
+    second = client.get("/items/WIDGET", headers=TENANT_A)
+    assert second.status_code == 200
+    assert second.json() == first.json()
+
+
+def test_get_item_cache_isolated_per_tenant(client, fake_db):
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=5, price=1.0, tenant_id="tenant-a"
+    )
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=50, price=10.0, tenant_id="tenant-b"
+    )
+    a = client.get("/items/WIDGET", headers=TENANT_A).json()
+    b = client.get("/items/WIDGET", headers=TENANT_B).json()
+    assert (a["price"], a["quantity"]) == (1.0, 5)
+    assert (b["price"], b["quantity"]) == (10.0, 50)
+    # warm-cache reads stay isolated too
+    assert client.get("/items/WIDGET", headers=TENANT_A).json()["price"] == 1.0
+    assert client.get("/items/WIDGET", headers=TENANT_B).json()["price"] == 10.0
+
+
+def test_get_item_cache_miss_for_other_tenant_is_404(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    assert client.get("/items/WIDGET", headers=TENANT_A).status_code == 200
+    assert client.get("/items/WIDGET", headers=TENANT_B).status_code == 404
+
+
+def test_reserve_stock_invalidates_item_cache(client, fake_db):
+    from app import cache
+
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=30, tenant_id="tenant-b")
+    assert client.get("/items/WIDGET", headers=TENANT_A).json()["quantity"] == 10
+    assert client.get("/items/WIDGET", headers=TENANT_B).json()["quantity"] == 30
+
+    resp = client.post(
+        "/items/reserve",
+        json={
+            "sku": "WIDGET",
+            "warehouse_id": "w1",
+            "quantity": 3,
+            "order_id": "order-1",
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+
+    assert cache.get(cache.item_key("tenant-a", "WIDGET")) is None
+    assert cache.get(cache.item_key("tenant-b", "WIDGET"))["quantity"] == 30
+    assert client.get("/items/WIDGET", headers=TENANT_A).json()["quantity"] == 7
+
+
+def test_item_key_is_tenant_scoped_and_collision_free():
+    from app import cache
+
+    assert cache.item_key("t1", "s") != cache.item_key("t2", "s")
+    assert cache.item_key("a:b", "c") != cache.item_key("a", "b:c")

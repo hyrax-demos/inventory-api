@@ -70,3 +70,17 @@ def invalidate_stock_all_warehouses(tenant_id: str, sku: str) -> None:
 def price_key(sku: str, warehouse_id: str) -> str:
     """Cache key for a SKU's price in a given warehouse."""
     return f"price:{warehouse_id}:{sku}"
+
+
+def item_key(tenant_id: str, sku: str) -> str:
+    """Cache key for a tenant's item row (price, quantity, ...) by SKU.
+
+    Item rows are looked up per (tenant_id, sku), so the key is tenant-scoped:
+    one tenant's cached price or quantity can never be served to another.
+    """
+    return f"item:{_part(tenant_id)}:{_part(sku)}"
+
+
+def invalidate_item(tenant_id: str, sku: str) -> None:
+    """Drop a tenant's cached item row for a SKU (other tenants untouched)."""
+    invalidate(item_key(tenant_id, sku))
