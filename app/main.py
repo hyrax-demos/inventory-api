@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 
 from app.routes import admin, items, reports, sync
 
@@ -18,3 +18,9 @@ def health():
 @app.get("/version")
 def version():
     return {"version": "1.0.0"}
+
+
+@app.get("/ping")
+def ping(response: Response):
+    response.headers["X-Pong"] = "1"
+    return {"pong": True}
