@@ -1,6 +1,6 @@
 """Inventory item lookup, search, and stock reservation."""
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app import cache
 from app.db import execute, fetch_all, fetch_one
@@ -25,7 +25,7 @@ def get_item(sku: str, tenant_id: str = Depends(require_tenant)):
 def search_items(
     warehouse_id: str = "",
     q: str = "",
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=200),
     cursor: str = "",
     tenant_id: str = Depends(require_tenant),
 ):

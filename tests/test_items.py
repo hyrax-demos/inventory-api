@@ -66,6 +66,22 @@ def test_search_items_paginates(client, fake_db):
     assert first_page_skus.isdisjoint(second_page_skus)
 
 
+def test_search_items_rejects_limit_zero(client, fake_db):
+    resp = client.get("/items", params={"limit": 0}, headers=TENANT_A)
+    assert resp.status_code == 422
+
+
+def test_search_items_rejects_limit_above_max(client, fake_db):
+    resp = client.get("/items", params={"limit": 201}, headers=TENANT_A)
+    assert resp.status_code == 422
+
+
+def test_search_items_accepts_limit_bounds(client, fake_db):
+    for limit in (1, 200):
+        resp = client.get("/items", params={"limit": limit}, headers=TENANT_A)
+        assert resp.status_code == 200
+
+
 def test_search_items_filters_by_warehouse(client, fake_db):
     fake_db.add_item(
         sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
