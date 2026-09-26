@@ -126,3 +126,55 @@ def test_reserve_stock_missing_item(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 404
+
+
+def _stock(client, sku, warehouse_id, headers):
+    resp = client.get(f"/items/{sku}/stock", params={"warehouse_id": warehouse_id}, headers=headers)
+    assert resp.status_code == 200
+    return resp.json()["quantity"]
+
+
+def test_get_stock_cache_is_scoped_by_warehouse(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=99, tenant_id="tenant-a")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    assert _stock(client, "WIDGET", "w2", TENANT_A) == 99
+    # cached reads still return each warehouse's own value
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    assert _stock(client, "WIDGET", "w2", TENANT_A) == 99
+
+
+def test_get_stock_cache_is_scoped_by_tenant(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    # tenant-b has no such item: must not be served tenant-a's cached value
+    resp = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_B)
+    assert resp.status_code == 404
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=3, tenant_id="tenant-b")
+    assert _stock(client, "WIDGET", "w1", TENANT_B) == 3
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+
+
+def test_get_stock_cache_keys_do_not_collide_on_delimiters(client, fake_db):
+    fake_db.add_item(sku="c", warehouse_id="b", quantity=1, tenant_id="a:x")
+    fake_db.add_item(sku="c", warehouse_id="x:b", quantity=2, tenant_id="a")
+    assert _stock(client, "c", "b", {"X-Tenant-Id": "a:x"}) == 1
+    assert _stock(client, "c", "x:b", {"X-Tenant-Id": "a"}) == 2
+
+
+def test_reserve_stock_is_reflected_on_next_stock_read(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=50, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=20, tenant_id="tenant-b")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    assert _stock(client, "WIDGET", "w2", TENANT_A) == 50
+    assert _stock(client, "WIDGET", "w1", TENANT_B) == 20
+    resp = client.post(
+        "/items/reserve",
+        json={"sku": "WIDGET", "warehouse_id": "w1", "quantity": 3, "order_id": "order-1"},
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 7
+    assert _stock(client, "WIDGET", "w2", TENANT_A) == 50
+    assert _stock(client, "WIDGET", "w1", TENANT_B) == 20
