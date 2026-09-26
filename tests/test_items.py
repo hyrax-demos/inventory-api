@@ -287,3 +287,122 @@ def test_patch_item_non_price_fields_do_not_require_admin(client, fake_db):
     )
     assert resp.status_code == 200
     assert resp.json()["name"] == "Gadget"
+
+
+def test_patch_item_records_one_history_row_per_changed_field(client, fake_db):
+    fake_db.add_item(
+        sku="WIDGET",
+        name="Widget",
+        warehouse_id="w1",
+        quantity=5,
+        price=1.5,
+        tenant_id="tenant-a",
+    )
+    resp = client.patch(
+        "/items/WIDGET",
+        json={"name": "Gadget", "price": 2.0, "warehouse_id": "w1"},
+        headers={**TENANT_A, **ADMIN_HEADERS},
+    )
+    assert resp.status_code == 200
+    recorded = {u["field"]: u for u in fake_db.item_updates}
+    # warehouse_id was sent with its current value, so nothing changed there.
+    assert set(recorded) == {"name", "price"}
+    assert recorded["name"]["old_value"] == "Widget"
+    assert recorded["name"]["new_value"] == "Gadget"
+    assert recorded["price"]["old_value"] == "1.5"
+    assert recorded["price"]["new_value"] == "2.0"
+    for u in recorded.values():
+        assert u["sku"] == "WIDGET"
+        assert u["tenant_id"] == "tenant-a"
+        assert u["created_at"] is not None
+
+
+def test_patch_item_rejected_or_empty_records_no_history(client, fake_db):
+    fake_db.add_item(
+        sku="WIDGET", name="Widget", warehouse_id="w1", quantity=5, tenant_id="tenant-a"
+    )
+    client.patch("/items/WIDGET", json={}, headers=TENANT_A)
+    client.patch("/items/WIDGET", json={"price": 3.0}, headers=TENANT_A)  # 401
+    client.patch("/items/NOPE", json={"name": "x"}, headers=TENANT_A)  # 404
+    assert fake_db.item_updates == []
+
+
+def test_item_history_newest_first(client, fake_db):
+    fake_db.add_item(
+        sku="WIDGET", name="Widget", warehouse_id="w1", quantity=5, tenant_id="tenant-a"
+    )
+    client.patch("/items/WIDGET", json={"name": "Gadget"}, headers=TENANT_A)
+    client.patch("/items/WIDGET", json={"name": "Gizmo"}, headers=TENANT_A)
+    resp = client.get("/items/WIDGET/history", headers=TENANT_A)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [(r["old_value"], r["new_value"]) for r in body["items"]] == [
+        ("Gadget", "Gizmo"),
+        ("Widget", "Gadget"),
+    ]
+    assert body["next_cursor"] is None
+
+
+def test_item_history_scoped_to_tenant(client, fake_db):
+    fake_db.add_item(
+        sku="WIDGET", name="Widget", warehouse_id="w1", quantity=5, tenant_id="tenant-a"
+    )
+    fake_db.add_item(
+        sku="WIDGET", name="Widget", warehouse_id="w1", quantity=5, tenant_id="tenant-b"
+    )
+    client.patch("/items/WIDGET", json={"name": "A-name"}, headers=TENANT_A)
+    client.patch("/items/WIDGET", json={"name": "B-name"}, headers=TENANT_B)
+
+    body_a = client.get("/items/WIDGET/history", headers=TENANT_A).json()
+    body_b = client.get("/items/WIDGET/history", headers=TENANT_B).json()
+    assert [r["new_value"] for r in body_a["items"]] == ["A-name"]
+    assert [r["new_value"] for r in body_b["items"]] == ["B-name"]
+
+    fake_db.add_item(
+        sku="SECRET", name="s", warehouse_id="w1", quantity=1, tenant_id="tenant-b"
+    )
+    client.patch("/items/SECRET", json={"name": "s2"}, headers=TENANT_B)
+    resp = client.get("/items/SECRET/history", headers=TENANT_A)
+    assert resp.status_code == 200
+    assert resp.json()["items"] == []
+
+
+def test_item_history_paginates(client, fake_db):
+    fake_db.add_item(
+        sku="WIDGET", name="n0", warehouse_id="w1", quantity=5, tenant_id="tenant-a"
+    )
+    for i in range(1, 6):
+        client.patch("/items/WIDGET", json={"name": f"n{i}"}, headers=TENANT_A)
+
+    seen: list[str] = []
+    cursor = None
+    pages = 0
+    while True:
+        params = {"limit": 2}
+        if cursor:
+            params["cursor"] = cursor
+        resp = client.get("/items/WIDGET/history", params=params, headers=TENANT_A)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["items"]) <= 2
+        seen.extend(r["new_value"] for r in body["items"])
+        pages += 1
+        cursor = body["next_cursor"]
+        if cursor is None:
+            break
+    assert pages == 3
+    assert seen == ["n5", "n4", "n3", "n2", "n1"]
+
+
+def test_item_history_invalid_cursor_and_limit(client, fake_db):
+    resp = client.get(
+        "/items/WIDGET/history", params={"cursor": "abc"}, headers=TENANT_A
+    )
+    assert resp.status_code == 400
+    resp = client.get("/items/WIDGET/history", params={"limit": 0}, headers=TENANT_A)
+    assert resp.status_code == 422
+
+
+def test_item_history_missing_tenant_header_is_rejected(client, fake_db):
+    resp = client.get("/items/WIDGET/history")
+    assert resp.status_code in (400, 422)

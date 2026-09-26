@@ -32,6 +32,7 @@ uvicorn app.main:app --reload
 | POST   | `/items/reserve`                | Reserve stock for an order           |
 | GET    | `/items/{sku}`                  | Look up a single item                |
 | PATCH  | `/items/{sku}`                  | Partially update `name`, `price`, `warehouse_id` |
+| GET    | `/items/{sku}/history`          | Field change history (paginated: `limit`, `cursor`) |
 | GET    | `/items/{sku}/stock`            | On-hand quantity (cached)            |
 | POST   | `/reports/import`               | Bulk-import a stock snapshot          |
 | GET    | `/reports/low-stock`            | Items at/below `threshold` (paginated: `limit`, `cursor`) |
@@ -54,6 +55,20 @@ Changing `price` also requires a valid `X-Admin-Token` header (the same token
 as the admin and sync endpoints); without it the request is rejected with
 `401` and nothing is changed. `name` and `warehouse_id` edits need only
 `X-Tenant-Id`.
+
+Every field whose value actually changes is recorded in the `item_updates`
+audit table (`sku`, `tenant_id`, `field`, `old_value`, `new_value`,
+`created_at`; values are stored as text) in the same transaction as the
+update. Rejected, empty, or no-op requests record nothing.
+
+### `GET /items/{sku}/history`
+
+Returns the caller's tenant's `item_updates` rows for the SKU, newest first,
+as `{"items", "next_cursor"}`. Paginate with `limit` (default `50`, must be
+`>= 1`) and `cursor` (the `next_cursor` from the previous page; omit for page
+1). `next_cursor` is `null` on the last page. A malformed `cursor` returns
+`400`. A SKU with no recorded changes, or one belonging to another tenant,
+returns an empty page.
 
 ### `GET /reports/low-stock` pagination
 

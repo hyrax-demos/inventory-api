@@ -1,10 +1,13 @@
 """Inventory item lookup, search, and stock reservation."""
 
-from fastapi import APIRouter, Header, HTTPException
+from datetime import datetime, timezone
+
+import psycopg2.extras
+from fastapi import APIRouter, Header, HTTPException, Query
 
 from app import cache
 from app.auth import require_admin
-from app.db import execute, fetch_all, fetch_one
+from app.db import execute, fetch_all, fetch_one, transaction
 from app.models import ItemUpdate, Page, ReservationRequest
 
 router = APIRouter()
@@ -67,13 +70,43 @@ def patch_item(
         return row
 
     set_clause = ", ".join(f"{col} = %s" for col in fields)
-    affected = execute(
-        f"UPDATE items SET {set_clause} WHERE id = %s AND tenant_id = %s",
-        (*fields.values(), row["id"], tenant_id),
-    )
-    if affected == 0:
-        # Deleted between the lookup and the update.
-        raise HTTPException(status_code=404, detail="not found")
+    # The update and its audit rows commit together, and old values are read
+    # under a row lock so concurrent PATCHes cannot record stale values.
+    with transaction() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT * FROM items WHERE id = %s AND tenant_id = %s FOR UPDATE",
+            (row["id"], tenant_id),
+        )
+        current = cur.fetchone()
+        if current is None:
+            # Deleted between the lookup and the update.
+            raise HTTPException(status_code=404, detail="not found")
+        cur.execute(
+            f"UPDATE items SET {set_clause} WHERE id = %s AND tenant_id = %s",
+            (*fields.values(), current["id"], tenant_id),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="not found")
+        changed_at = datetime.now(timezone.utc)
+        for col, new_value in fields.items():
+            old_value = current.get(col)
+            if old_value == new_value:
+                continue
+            cur.execute(
+                "INSERT INTO item_updates "
+                "(sku, tenant_id, field, old_value, new_value, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (
+                    sku,
+                    tenant_id,
+                    col,
+                    None if old_value is None else str(old_value),
+                    str(new_value),
+                    changed_at,
+                ),
+            )
+    row = current
 
     cache.invalidate(cache.stock_key(sku))
     cache.invalidate(cache.price_key(sku, row["warehouse_id"]))
@@ -118,6 +151,42 @@ def search_items(
     next_cursor = None
     if len(rows) > limit:
         next_cursor = rows[limit]["id"]
+        rows = rows[:limit]
+    return Page(items=rows, next_cursor=next_cursor)
+
+
+@router.get("/items/{sku}/history")
+def item_history(
+    sku: str,
+    limit: int = Query(default=50, ge=1),
+    cursor: str = "",
+    x_tenant_id: str = Header(),
+):
+    """Field-level change history recorded by PATCH /items/{sku}.
+
+    Newest first, keyset-paginated by id like ``/items``: ``next_cursor`` is
+    the id of the first row of the next page.
+    """
+    tenant_id = _tenant(x_tenant_id)
+    clauses = ["sku = %s", "tenant_id = %s"]
+    params: list = [sku, tenant_id]
+    if cursor:
+        try:
+            cursor_id = int(cursor)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid cursor")
+        clauses.append("id <= %s")
+        params.append(cursor_id)
+    where = " AND ".join(clauses)
+    params.append(limit + 1)
+    rows = fetch_all(
+        "SELECT id, sku, field, old_value, new_value, created_at "
+        f"FROM item_updates WHERE {where} ORDER BY id DESC LIMIT %s",
+        tuple(params),
+    )
+    next_cursor = None
+    if len(rows) > limit:
+        next_cursor = str(rows[limit]["id"])
         rows = rows[:limit]
     return Page(items=rows, next_cursor=next_cursor)
 

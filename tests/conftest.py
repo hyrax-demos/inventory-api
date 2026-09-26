@@ -42,7 +42,9 @@ class FakeDB:
         self.items: list[dict] = []
         self.reservations: list[dict] = []
         self.movements: list[dict] = []
+        self.item_updates: list[dict] = []
         self._next_id = 1
+        self._next_update_id = 1
 
     # -- seeding helpers used by tests --
     def add_item(self, **kw) -> dict:
@@ -61,9 +63,24 @@ class FakeDB:
         self.movements.append(row)
         return row
 
+    def add_item_update(self, **kw) -> dict:
+        row = {"id": self._next_update_id, **kw}
+        self._next_update_id += 1
+        self.item_updates.append(row)
+        return row
+
     # -- fetch_all --
     def fetch_all(self, sql: str, params: tuple = ()):
         params = list(params)
+        if sql.startswith("SELECT * FROM items WHERE id = %s AND tenant_id = %s"):
+            item_id, tenant_id = params
+            return [
+                dict(r)
+                for r in self.items
+                if r["id"] == item_id and r["tenant_id"] == tenant_id
+            ]
+        if "FROM item_updates" in sql:
+            return self._item_history(sql, params)
         if "ORDER BY id ASC LIMIT" in sql:
             return self._search_items(sql, params)
         if "quantity <= %s" in sql:
@@ -135,6 +152,22 @@ class FakeDB:
             rows = [r for r in rows if r["id"] >= cursor]
         rows.sort(key=lambda r: r["id"])
         return [dict(r) for r in rows[:limit_plus1]]
+
+    def _item_history(self, sql: str, params: list):
+        params = list(params)
+        sku, tenant_id = params.pop(0), params.pop(0)
+        limit_plus1 = params.pop(-1)
+        cursor = params.pop(0) if "id <= %s" in sql else None
+        cols = ("id", "sku", "field", "old_value", "new_value", "created_at")
+        rows = [
+            {k: r[k] for k in cols}
+            for r in self.item_updates
+            if r["sku"] == sku and r["tenant_id"] == tenant_id
+        ]
+        if cursor is not None:
+            rows = [r for r in rows if r["id"] <= cursor]
+        rows.sort(key=lambda r: r["id"], reverse=True)
+        return rows[:limit_plus1]
 
     def _low_stock(self, sql: str, params: list):
         params = list(params)
@@ -288,6 +321,18 @@ class FakeDB:
                 lambda r: r["sku"] == sku and r["tenant_id"] == tenant_id,
                 lambda r: r.__setitem__("quantity", r["quantity"] + delta),
             )
+
+        if sql.startswith("INSERT INTO item_updates"):
+            sku, tenant_id, field, old_value, new_value, created_at = params
+            self.add_item_update(
+                sku=sku,
+                tenant_id=tenant_id,
+                field=field,
+                old_value=old_value,
+                new_value=new_value,
+                created_at=created_at,
+            )
+            return 1
 
         if sql.startswith("DELETE FROM reservations"):
             order_id, tenant_id = params
