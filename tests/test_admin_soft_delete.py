@@ -89,3 +89,46 @@ def test_empty_tenant_is_rejected(client, fake_db):
         client.post("/admin/items/WIDGET/restore", headers=headers).status_code == 400
     )
     assert row["deleted_at"] is None
+
+
+def test_list_deleted_items_is_admin_only_and_tenant_scoped(client, fake_db):
+    _seed(fake_db, tenant_id="tenant-a", sku="WIDGET")
+    _seed(fake_db, tenant_id="tenant-a", sku="LIVE")
+    _seed(fake_db, tenant_id="tenant-b", sku="WIDGET")
+    _seed(fake_db, tenant_id="tenant-b", sku="OTHER")
+
+    assert client.get("/admin/items/deleted", headers=ADMIN_A).json() == {"items": []}
+
+    assert client.delete("/admin/items/WIDGET", headers=ADMIN_A).status_code == 200
+    assert client.delete("/admin/items/OTHER", headers=ADMIN_B).status_code == 200
+
+    resp = client.get("/admin/items/deleted", headers=ADMIN_A)
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert [(i["tenant_id"], i["sku"]) for i in items] == [("tenant-a", "WIDGET")]
+    assert items[0]["deleted_at"] is not None
+
+    resp_b = client.get("/admin/items/deleted", headers=ADMIN_B)
+    assert [i["sku"] for i in resp_b.json()["items"]] == ["OTHER"]
+
+    # Restoring removes the item from the deleted listing.
+    assert (
+        client.post("/admin/items/WIDGET/restore", headers=ADMIN_A).status_code == 200
+    )
+    assert client.get("/admin/items/deleted", headers=ADMIN_A).json() == {"items": []}
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [READER_A, {**READER_A, "X-Admin-Token": "wrong"}],
+    ids=["no-token", "wrong-token"],
+)
+def test_list_deleted_items_rejects_non_admin(client, fake_db, headers):
+    row = _seed(fake_db)
+    row["deleted_at"] = "2024-01-01T00:00:00Z"
+    assert client.get("/admin/items/deleted", headers=headers).status_code == 401
+
+
+def test_list_deleted_items_rejects_empty_tenant(client, fake_db):
+    headers = {**ADMIN_A, "X-Tenant-Id": ""}
+    assert client.get("/admin/items/deleted", headers=headers).status_code == 400

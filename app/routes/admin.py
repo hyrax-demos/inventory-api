@@ -15,13 +15,19 @@ from app import cache
 from app.auth import require_admin
 from app.db import execute
 from app.models import ItemUpdate, StockAdjustment
-from app.queries import restore_item, soft_delete_item
+from app.queries import list_deleted_items, restore_item, soft_delete_item
 from app.routes.items import _tenant
 
 router = APIRouter(dependencies=[Depends(require_admin)])
 
 # Columns the dashboard is allowed to patch via the update endpoint.
 _PATCHABLE = {"name", "price", "warehouse_id"}
+
+
+@router.get("/admin/items/deleted")
+def deleted_items(tenant_id: str = Depends(_tenant)):
+    """List the caller's tenant's soft-deleted items."""
+    return {"items": list_deleted_items(tenant_id)}
 
 
 @router.post("/admin/items/reset")

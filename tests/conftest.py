@@ -145,6 +145,17 @@ class FakeDB:
             out = list(lines.values())
             out.sort(key=lambda r: r["reserved_value"], reverse=True)
             return out
+        if sql.startswith("SELECT * FROM items WHERE tenant_id = %s AND deleted_at"):
+            (tenant_id,) = params
+            assert "deleted_at IS NOT NULL" in sql
+            rows = [
+                dict(r)
+                for r in self.items
+                if r["tenant_id"] == tenant_id and r.get("deleted_at") is not None
+            ]
+            rows.sort(key=lambda r: r["id"])
+            rows.sort(key=lambda r: r["deleted_at"], reverse=True)
+            return rows
         raise AssertionError(f"FakeDB.fetch_all: unrecognized query: {sql!r}")
 
     def _search_items(self, sql: str, params: list):

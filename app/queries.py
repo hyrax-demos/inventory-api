@@ -7,7 +7,7 @@ include :func:`live_items` so this rule lives in exactly one place.
 """
 
 from app import cache
-from app.db import execute
+from app.db import execute, fetch_all
 
 # The one definition of "live" (not soft-deleted) item rows.
 LIVE_ITEMS = "deleted_at IS NULL"
@@ -30,7 +30,7 @@ def soft_delete_item(tenant_id: str, sku: str) -> bool:
     """
     affected = execute(
         "UPDATE items SET deleted_at = now() "
-        f"WHERE tenant_id = %s AND sku = %s AND {LIVE_ITEMS}",
+        "WHERE tenant_id = %s AND sku = %s AND deleted_at IS NULL",
         (tenant_id, sku),
     )
     if affected:
@@ -54,3 +54,12 @@ def restore_item(tenant_id: str, sku: str) -> bool:
     if affected:
         cache.invalidate(cache.stock_key(tenant_id, sku))
     return affected > 0
+
+
+def list_deleted_items(tenant_id: str) -> list[dict]:
+    """Return one tenant's soft-deleted items, most recently deleted first."""
+    return fetch_all(
+        "SELECT * FROM items WHERE tenant_id = %s AND deleted_at IS NOT NULL "
+        "ORDER BY deleted_at DESC, id ASC",
+        (tenant_id,),
+    )
