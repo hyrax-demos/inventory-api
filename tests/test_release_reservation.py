@@ -116,6 +116,11 @@ class _RecordingCursor:
         self._conn.statements.append(sql)
         self.rowcount = 1
 
+    def fetchone(self):
+        # The locked claim SELECT finds the seeded reservation, so the
+        # handler proceeds to (and fails on) the stock restore.
+        return {"sku": "WIDGET", "warehouse_id": "w1", "quantity": 3}
+
 
 def test_release_rolls_back_real_transaction_on_restore_failure(
     lenient_client, fake_db, monkeypatch
@@ -150,3 +155,99 @@ def test_release_rolls_back_real_transaction_on_restore_failure(
     assert not any(s.startswith("DELETE FROM reservations") for s in conn.statements)
     assert len(fake_db.reservations) == 1
     assert fake_db.items[0]["quantity"] == 5
+
+
+def test_release_rolls_back_real_transaction_reaches_restore(
+    lenient_client, fake_db, monkeypatch
+):
+    """The claim happens under a row lock inside the same transaction, and the
+    failure really comes from the restore (not an earlier step)."""
+    _seed(fake_db)
+    conns: list[_RecordingConnection] = []
+
+    def fake_get_connection():
+        conn = _RecordingConnection()
+        conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(db_module, "get_connection", fake_get_connection)
+    monkeypatch.setattr(sync_routes, "transaction", db_module.transaction)
+
+    resp = lenient_client.post("/reservations/order-1/release", headers=TENANT_A)
+
+    assert resp.status_code == 500
+    assert len(conns) == 1
+    stmts = conns[0].statements
+    assert len(stmts) == 1
+    assert stmts[0].startswith("SELECT sku, warehouse_id, quantity FROM reservations")
+    assert "FOR UPDATE" in stmts[0]
+    assert conns[0].rolled_back is True
+
+
+# -- idempotency: the second release is a 404 and never restores stock --
+
+
+def test_release_twice_restores_stock_only_once(client, fake_db):
+    _seed(fake_db)
+
+    first = client.post("/reservations/order-1/release", headers=TENANT_A)
+    second = client.post("/reservations/order-1/release", headers=TENANT_A)
+
+    assert first.status_code == 200
+    assert first.json() == {"order_id": "order-1", "released": 3}
+    assert second.status_code == 404
+    assert second.json() == {"detail": "no such reservation"}
+    # 5 on hand + 3 reserved, restored exactly once.
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
+
+
+def test_release_unknown_reservation_is_404_and_leaves_stock(client, fake_db):
+    _seed(fake_db)
+
+    resp = client.post("/reservations/no-such-order/release", headers=TENANT_A)
+
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "no such reservation"}
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1
+
+
+def test_release_other_tenants_reservation_is_404(client, fake_db):
+    _seed(fake_db)
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-b"}
+    )
+
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1
+
+
+def test_back_to_back_releases_restore_stock_once(client, fake_db):
+    _seed(fake_db)
+
+    statuses = [
+        client.post("/reservations/order-1/release", headers=TENANT_A).status_code
+        for _ in range(5)
+    ]
+
+    assert statuses == [200, 404, 404, 404, 404]
+    assert fake_db.items[0]["quantity"] == 8
+
+
+def test_release_existence_check_is_inside_transaction(client, fake_db, monkeypatch):
+    """No unlocked pre-transaction read: the claim must go through the
+    transaction's cursor, not a standalone fetch_one."""
+    _seed(fake_db)
+    monkeypatch.setattr(
+        sync_routes,
+        "fetch_one",
+        lambda *a, **k: pytest.fail("release must claim inside the transaction"),
+    )
+
+    resp = client.post("/reservations/order-1/release", headers=TENANT_A)
+
+    assert resp.status_code == 200
+    assert fake_db.items[0]["quantity"] == 8
