@@ -9,12 +9,12 @@ def test_stock_key_scoped_by_tenant_warehouse_and_sku():
 
 
 def test_stock_key_components_cannot_collide_via_separator():
-    assert cache.stock_key(tenant_id="a:b", warehouse_id="w", sku="c") != cache.stock_key(
-        tenant_id="a", warehouse_id="w", sku="b:c"
-    )
-    assert cache.stock_key(tenant_id="t", warehouse_id="w", sku="a:b") != cache.stock_key(
-        tenant_id="t", warehouse_id="b:w", sku="a"
-    )
+    assert cache.stock_key(
+        tenant_id="a:b", warehouse_id="w", sku="c"
+    ) != cache.stock_key(tenant_id="a", warehouse_id="w", sku="b:c")
+    assert cache.stock_key(
+        tenant_id="t", warehouse_id="w", sku="a:b"
+    ) != cache.stock_key(tenant_id="t", warehouse_id="b:w", sku="a")
 
 
 def test_invalidate_prefix_drops_only_that_tenant_and_sku():
