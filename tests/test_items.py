@@ -126,3 +126,49 @@ def test_reserve_stock_missing_item(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 404
+
+
+def test_get_stock_same_sku_in_two_warehouses_is_not_shared(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=99, tenant_id="tenant-a")
+    first = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    second = client.get("/items/WIDGET/stock", params={"warehouse_id": "w2"}, headers=TENANT_A)
+    assert first.json()["quantity"] == 10
+    assert second.json()["quantity"] == 99
+    # And the cached w1 value is still w1's, not overwritten by w2.
+    again = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    assert again.json()["quantity"] == 10
+
+
+def test_get_stock_cache_is_not_shared_across_tenants(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=3, tenant_id="tenant-b")
+    a = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    b = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_B)
+    assert a.json()["quantity"] == 10
+    assert b.json()["quantity"] == 3
+
+
+def test_get_stock_cached_value_does_not_leak_to_tenant_without_the_item(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    assert client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A).status_code == 200
+    resp = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_B)
+    assert resp.status_code == 404
+
+
+def test_reserve_stock_is_reflected_on_next_stock_read(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=20, tenant_id="tenant-a")
+    # Warm the cache for both warehouses.
+    assert client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A).json()["quantity"] == 10
+    assert client.get("/items/WIDGET/stock", params={"warehouse_id": "w2"}, headers=TENANT_A).json()["quantity"] == 20
+    resp = client.post(
+        "/items/reserve",
+        json={"sku": "WIDGET", "warehouse_id": "w1", "quantity": 4, "order_id": "order-1"},
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+    after = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    assert after.json()["quantity"] == 6
+    other = client.get("/items/WIDGET/stock", params={"warehouse_id": "w2"}, headers=TENANT_A)
+    assert other.json()["quantity"] == 20
