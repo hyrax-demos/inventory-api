@@ -1,4 +1,5 @@
 """Inventory item lookup, search, and stock reservation."""
+
 from fastapi import APIRouter, Header, HTTPException, Query
 
 from app import cache
