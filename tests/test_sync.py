@@ -4,6 +4,7 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
+from app import cache as cache_module
 from app import db as db_module
 from app.main import app
 from app.routes import sync as sync_routes
@@ -302,3 +303,170 @@ def test_release_other_tenants_reservation_is_rejected(fake_db, tx):
     assert stock == {"tenant-a": 5, "tenant-b": 10}
     assert "commit" not in tx.events
     assert not any(e.startswith("invalidate:") for e in tx.events)
+
+
+# -- cache-correct release --------------------------------------------------
+#
+# These go through the real in-process cache (app.cache): nothing here patches
+# cache.get / cache.put / cache.invalidate, so a stale entry left behind by the
+# release path would be served by GET /items/{sku}/stock.
+
+
+def _stock(client, sku, warehouse_id, tenant_id):
+    resp = client.get(
+        f"/items/{sku}/stock",
+        params={"warehouse_id": warehouse_id},
+        headers={"X-Tenant-Id": tenant_id},
+    )
+    assert resp.status_code == 200
+    return resp.json()["quantity"]
+
+
+def test_release_reservation_invalidates_cached_stock(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    headers = {"X-Tenant-Id": "tenant-a"}
+    reserve = client.post(
+        "/items/reserve",
+        json={
+            "sku": "WIDGET",
+            "warehouse_id": "w1",
+            "quantity": 3,
+            "order_id": "order-1",
+        },
+        headers=headers,
+    )
+    assert reserve.status_code == 200
+
+    # Prime the cache with the reduced quantity.
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 7
+    assert cache_module.get(cache_module.stock_key("tenant-a", "w1", "WIDGET")) == 7
+
+    resp = client.post("/reservations/order-1/release", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json() == {"order_id": "order-1", "released": 3}
+
+    # The next read sees the freshly restored quantity, not the cached 7.
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 10
+
+
+def test_release_reservation_leaves_other_skus_cached(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_item(sku="GADGET", warehouse_id="w1", quantity=4, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 5
+    assert _stock(client, "GADGET", "w1", "tenant-a") == 4
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+
+    # Only the released reservation's SKU is invalidated.
+    assert cache_module.get(cache_module.stock_key("tenant-a", "w1", "WIDGET")) is None
+    assert cache_module.get(cache_module.stock_key("tenant-a", "w1", "GADGET")) == 4
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 8
+
+
+def test_failed_second_release_does_not_invalidate_cache(client, fake_db):
+    _seed_reservation(fake_db)
+    headers = {"X-Tenant-Id": "tenant-a"}
+    assert (
+        client.post("/reservations/order-1/release", headers=headers).status_code == 200
+    )
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 8
+
+    # A no-op (404) second release leaves the fresh cache entry in place.
+    assert (
+        client.post("/reservations/order-1/release", headers=headers).status_code == 404
+    )
+    assert cache_module.get(cache_module.stock_key("tenant-a", "w1", "WIDGET")) == 8
+
+
+def _seed_same_sku_elsewhere(fake_db):
+    """Same SKU in another warehouse of tenant-a and in tenant-b's w1."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=20, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=30, tenant_id="tenant-b")
+
+
+def test_get_stock_cache_is_scoped_to_tenant_and_warehouse(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    _seed_same_sku_elsewhere(fake_db)
+
+    # Each read primes its own entry; none is served another's cached value.
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 5
+    assert _stock(client, "WIDGET", "w2", "tenant-a") == 20
+    assert _stock(client, "WIDGET", "w1", "tenant-b") == 30
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 5
+    assert cache_module.get(cache_module.stock_key("tenant-a", "w1", "WIDGET")) == 5
+    assert cache_module.get(cache_module.stock_key("tenant-a", "w2", "WIDGET")) == 20
+    assert cache_module.get(cache_module.stock_key("tenant-b", "w1", "WIDGET")) == 30
+
+
+def test_release_reservation_invalidates_only_its_tenant_and_warehouse(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    _seed_same_sku_elsewhere(fake_db)
+    reserve = client.post(
+        "/items/reserve",
+        json={
+            "sku": "WIDGET",
+            "warehouse_id": "w1",
+            "quantity": 3,
+            "order_id": "order-1",
+        },
+        headers={"X-Tenant-Id": "tenant-a"},
+    )
+    assert reserve.status_code == 200
+
+    # Prime the cache for all three (tenant, warehouse) combinations.
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 7
+    assert _stock(client, "WIDGET", "w2", "tenant-a") == 20
+    assert _stock(client, "WIDGET", "w1", "tenant-b") == 30
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+
+    # Only the released reservation's tenant + warehouse + sku entry is gone.
+    assert cache_module.get(cache_module.stock_key("tenant-a", "w1", "WIDGET")) is None
+    assert cache_module.get(cache_module.stock_key("tenant-a", "w2", "WIDGET")) == 20
+    assert cache_module.get(cache_module.stock_key("tenant-b", "w1", "WIDGET")) == 30
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 10
+    assert _stock(client, "WIDGET", "w2", "tenant-a") == 20
+    assert _stock(client, "WIDGET", "w1", "tenant-b") == 30
+
+
+def test_release_uses_reservation_warehouse_for_invalidation(client, fake_db):
+    # The reservation is held in w2; the release request carries no warehouse,
+    # so the key must come from the released row, not a default/other value.
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=6, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-2",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w2",
+        quantity=4,
+    )
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 5
+    assert _stock(client, "WIDGET", "w2", "tenant-a") == 6
+
+    resp = client.post(
+        "/reservations/order-2/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+
+    assert _stock(client, "WIDGET", "w2", "tenant-a") == 10
+    assert cache_module.get(cache_module.stock_key("tenant-a", "w1", "WIDGET")) == 5
+
+
+def test_stock_key_parts_cannot_collide():
+    assert cache_module.stock_key("t:a", "w", "s") != cache_module.stock_key(
+        "t", "a:w", "s"
+    )

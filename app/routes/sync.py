@@ -89,6 +89,8 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
             "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
             (quantity, sku, warehouse_id, x_tenant_id),
         )
-    # Only reached once the transaction has committed.
-    cache.invalidate(cache.stock_key(sku))
+    # Only reached once the transaction has committed, and only when this call
+    # actually released a row. Invalidate exactly the key GET
+    # /items/{sku}/stock reads, using the released row's sku + warehouse.
+    cache.invalidate_stock(x_tenant_id, sku, warehouse_id)
     return {"order_id": order_id, "released": quantity}
