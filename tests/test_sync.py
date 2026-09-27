@@ -146,3 +146,41 @@ def test_release_reservation_stock_update_failure_keeps_reservation(
 
 def test_release_reservation_delete_failure_rolls_back_stock(monkeypatch, fake_db):
     _assert_atomic_failure(monkeypatch, fake_db, "DELETE FROM reservations")
+
+
+def test_release_reservation_twice_restores_stock_once(client, fake_db):
+    _seed(fake_db)
+    headers = {"X-Tenant-Id": "tenant-a"}
+    first = client.post("/reservations/order-1/release", headers=headers)
+    assert first.status_code == 200
+    assert fake_db.items[0]["quantity"] == 8
+    second = client.post("/reservations/order-1/release", headers=headers)
+    assert second.status_code == 404
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
+
+
+def test_release_reservation_other_tenant_is_not_found(client, fake_db):
+    _seed(fake_db)
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-b")
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-b"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+    assert fake_db.items[1]["quantity"] == 10
+    assert len(fake_db.reservations) == 1
+
+
+def test_release_reservation_not_found_skips_cache_invalidation(
+    client, fake_db, monkeypatch
+):
+    from app.routes import sync as sync_routes
+
+    calls = []
+    monkeypatch.setattr(sync_routes.cache, "invalidate", calls.append)
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 404
+    assert calls == []
