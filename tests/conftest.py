@@ -135,7 +135,7 @@ class FakeDB:
         limit_plus1 = params.pop(-1)
         warehouse_id = params.pop(0) if "warehouse_id = %s" in sql else None
         name_like = params.pop(0) if "name ILIKE %s" in sql else None
-        cursor = params.pop(0) if "id >= %s" in sql else None
+        cursor = params.pop(0) if "id > %s" in sql else None
         rows = [r for r in self.items if r["tenant_id"] == tenant_id]
         if warehouse_id is not None:
             rows = [r for r in rows if r["warehouse_id"] == warehouse_id]
@@ -143,7 +143,7 @@ class FakeDB:
             needle = name_like.strip("%").lower()
             rows = [r for r in rows if needle in r["name"].lower()]
         if cursor is not None:
-            rows = [r for r in rows if r["id"] >= cursor]
+            rows = [r for r in rows if r["id"] > cursor]
         rows.sort(key=lambda r: r["id"])
         return [dict(r) for r in rows[:limit_plus1]]
 
