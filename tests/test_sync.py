@@ -99,3 +99,88 @@ def test_release_reservation_rolls_back_when_stock_restore_fails(
             "quantity": 3,
         }
     ]
+
+
+def test_release_reservation_twice_restores_stock_only_once(client, fake_db):
+    """Releasing the same reservation a second time must be safe: the guard
+    lives inside the transaction (a SELECT ... FOR UPDATE on the reservation
+    row), so the second call finds no row and must not restore stock again."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+
+    first = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert first.status_code == 200
+    assert first.json()["released"] == 3
+    assert fake_db.items[0]["quantity"] == 8
+
+    second = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert second.status_code == 404
+
+    # Stock reflects exactly one restore, not two.
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
+
+
+def test_release_reservation_never_existed_leaves_stock_unchanged(client, fake_db):
+    """An id that was never a real reservation gets the same "not found"
+    response as an already-released one, and never touches stock."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+
+    resp = client.post(
+        "/reservations/never-existed/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+
+
+def test_release_reservation_wrong_tenant_is_treated_as_not_found(client, fake_db):
+    """A reservation belonging to another tenant must not be released, and
+    must not leak its existence via a different status code."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-b")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-b",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1
+
+
+def test_release_reservation_called_twice_stock_delta_matches_quantity_once(
+    client, fake_db
+):
+    """Calling the release logic twice in a row must move stock by exactly
+    the reservation's quantity, once -- never twice, never zero."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=4,
+    )
+
+    before = fake_db.items[0]["quantity"]
+
+    client.post("/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"})
+    client.post("/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"})
+
+    after = fake_db.items[0]["quantity"]
+    assert after - before == 4
