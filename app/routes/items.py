@@ -1,9 +1,11 @@
 """Inventory item lookup, search, and stock reservation."""
+
 from fastapi import APIRouter, Header, HTTPException
 
 from app import cache
 from app.db import execute, fetch_all, fetch_one
 from app.models import Page, ReservationRequest
+from app.queries import live_items
 
 router = APIRouter()
 
@@ -18,7 +20,7 @@ def _tenant(x_tenant_id: str = Header()) -> str:
 def get_item(sku: str, x_tenant_id: str = Header()):
     tenant_id = _tenant(x_tenant_id)
     row = fetch_one(
-        "SELECT * FROM items WHERE sku = %s AND tenant_id = %s",
+        f"SELECT * FROM items WHERE sku = %s AND tenant_id = %s AND {live_items()}",
         (sku, tenant_id),
     )
     if row is None:
@@ -36,7 +38,7 @@ def search_items(
 ):
     """Search items, newest id last, with keyset pagination by id."""
     tenant_id = _tenant(x_tenant_id)
-    clauses = ["tenant_id = %s"]
+    clauses = ["tenant_id = %s", live_items()]
     params: list = [tenant_id]
     if warehouse_id:
         clauses.append("warehouse_id = %s")
@@ -71,7 +73,7 @@ def get_stock(sku: str, warehouse_id: str, x_tenant_id: str = Header()):
         return {"sku": sku, "warehouse_id": warehouse_id, "quantity": cached}
     row = fetch_one(
         "SELECT quantity FROM items "
-        "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
+        f"WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s AND {live_items()}",
         (sku, warehouse_id, tenant_id),
     )
     if row is None:
@@ -99,7 +101,7 @@ def reserve_stock(req: ReservationRequest, x_tenant_id: str = Header()):
 
     row = fetch_one(
         "SELECT quantity FROM items "
-        "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
+        f"WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s AND {live_items()}",
         (req.sku, req.warehouse_id, tenant_id),
     )
     if row is None:

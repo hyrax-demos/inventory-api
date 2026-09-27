@@ -4,9 +4,11 @@ Everything runs in-process against a FakeDB: no Postgres, no network, no
 real secrets. Environment variables the app reads at import time are set
 before ``app.main`` is imported for the first time.
 """
+
 import re
 import os
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 os.environ.setdefault("SECRET_KEY", "test-secret-key")
 os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
@@ -17,6 +19,7 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app import cache as cache_module  # noqa: E402
+from app import queries as queries_module  # noqa: E402
 from app.main import app  # noqa: E402
 from app.routes import admin as admin_routes  # noqa: E402
 from app.routes import items as items_routes  # noqa: E402
@@ -45,7 +48,13 @@ class FakeDB:
 
     # -- seeding helpers used by tests --
     def add_item(self, **kw) -> dict:
-        row = {"id": str(self._next_id), "name": "item", "price": 0.0, **kw}
+        row = {
+            "id": str(self._next_id),
+            "name": "item",
+            "price": 0.0,
+            "deleted_at": None,
+            **kw,
+        }
         self._next_id += 1
         self.items.append(row)
         return row
@@ -59,6 +68,12 @@ class FakeDB:
         row = dict(kw)
         self.movements.append(row)
         return row
+
+    @staticmethod
+    def _visible(sql: str, row: dict, alias: str = "") -> bool:
+        """Honor the query layer's live-items condition when the SQL carries it."""
+        live = f"{alias}.deleted_at IS NULL" if alias else "deleted_at IS NULL"
+        return live not in sql or row.get("deleted_at") is None
 
     # -- fetch_all --
     def fetch_all(self, sql: str, params: tuple = ()):
@@ -75,7 +90,9 @@ class FakeDB:
                     "quantity": r["quantity"],
                 }
                 for r in self.items
-                if r["tenant_id"] == tenant_id and r["quantity"] <= threshold
+                if r["tenant_id"] == tenant_id
+                and r["quantity"] <= threshold
+                and self._visible(sql, r)
             ]
             rows.sort(key=lambda r: r["quantity"])
             return rows
@@ -107,6 +124,7 @@ class FakeDB:
                         if i["sku"] == r["sku"]
                         and i["warehouse_id"] == r["warehouse_id"]
                         and (not tenant_scoped_join or i["tenant_id"] == tenant_id)
+                        and self._visible(sql, i, alias="i")
                     ),
                     None,
                 )
@@ -136,7 +154,11 @@ class FakeDB:
         warehouse_id = params.pop(0) if "warehouse_id = %s" in sql else None
         name_like = params.pop(0) if "name ILIKE %s" in sql else None
         cursor = params.pop(0) if "id >= %s" in sql else None
-        rows = [r for r in self.items if r["tenant_id"] == tenant_id]
+        rows = [
+            r
+            for r in self.items
+            if r["tenant_id"] == tenant_id and self._visible(sql, r)
+        ]
         if warehouse_id is not None:
             rows = [r for r in rows if r["warehouse_id"] == warehouse_id]
         if name_like is not None:
@@ -153,7 +175,13 @@ class FakeDB:
         if sql.startswith("SELECT * FROM items WHERE sku = %s AND tenant_id = %s"):
             sku, tenant_id = params
             return next(
-                (dict(r) for r in self.items if r["sku"] == sku and r["tenant_id"] == tenant_id),
+                (
+                    dict(r)
+                    for r in self.items
+                    if r["sku"] == sku
+                    and r["tenant_id"] == tenant_id
+                    and self._visible(sql, r)
+                ),
                 None,
             )
         if sql.startswith("SELECT quantity FROM items"):
@@ -165,6 +193,7 @@ class FakeDB:
                     if r["sku"] == sku
                     and r["warehouse_id"] == warehouse_id
                     and r["tenant_id"] == tenant_id
+                    and self._visible(sql, r)
                 ),
                 None,
             )
@@ -197,12 +226,38 @@ class FakeDB:
     def execute(self, sql: str, params: tuple = ()):
         params = list(params)
 
+        if sql.startswith("UPDATE items SET deleted_at = now()"):
+            tenant_id, sku = params
+            assert "deleted_at IS NULL" in sql
+            return self._update_items(
+                lambda r: (
+                    r["tenant_id"] == tenant_id
+                    and r["sku"] == sku
+                    and r.get("deleted_at") is None
+                ),
+                lambda r: r.__setitem__("deleted_at", datetime.now(timezone.utc)),
+            )
+
+        if sql.startswith("UPDATE items SET deleted_at = NULL"):
+            tenant_id, sku = params
+            assert "deleted_at IS NOT NULL" in sql
+            return self._update_items(
+                lambda r: (
+                    r["tenant_id"] == tenant_id
+                    and r["sku"] == sku
+                    and r.get("deleted_at") is not None
+                ),
+                lambda r: r.__setitem__("deleted_at", None),
+            )
+
         if sql.startswith("UPDATE items SET quantity = quantity - %s"):
             delta, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", r["quantity"] - delta),
             )
 
@@ -219,7 +274,10 @@ class FakeDB:
             )
             return 1
 
-        if sql.startswith("UPDATE items SET") and "WHERE id = %s AND tenant_id = %s" in sql:
+        if (
+            sql.startswith("UPDATE items SET")
+            and "WHERE id = %s AND tenant_id = %s" in sql
+        ):
             *values, item_id, tenant_id = params
             cols = re.findall(r"(\w+) = %s", sql.split("WHERE")[0])
             return self._update_items(
@@ -230,27 +288,36 @@ class FakeDB:
         if sql.startswith("UPDATE items SET quantity = %s"):
             quantity, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", quantity),
             )
 
         if sql.startswith("UPDATE items SET price = %s"):
             price, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("price", price),
             )
 
-        if sql.startswith("UPDATE items SET quantity = quantity + %s") and "warehouse_id = %s" in sql:
+        if (
+            sql.startswith("UPDATE items SET quantity = quantity + %s")
+            and "warehouse_id = %s" in sql
+        ):
             delta, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", r["quantity"] + delta),
             )
 
@@ -282,7 +349,9 @@ class FakeDB:
             item_id, tenant_id = params
             before = len(self.items)
             self.items = [
-                r for r in self.items if not (r["id"] == item_id and r["tenant_id"] == tenant_id)
+                r
+                for r in self.items
+                if not (r["id"] == item_id and r["tenant_id"] == tenant_id)
             ]
             return before - len(self.items)
 
@@ -380,7 +449,13 @@ def fake_db(monkeypatch) -> FakeDB:
     # `transaction` to wrap several statements atomically), and this fixture
     # must still patch whichever names end up bound there rather than
     # asserting today's exact import list.
-    for module in (items_routes, reports_routes, sync_routes, admin_routes):
+    for module in (
+        items_routes,
+        reports_routes,
+        sync_routes,
+        admin_routes,
+        queries_module,
+    ):
         monkeypatch.setattr(module, "fetch_all", fake.fetch_all, raising=False)
         monkeypatch.setattr(module, "fetch_one", fake.fetch_one, raising=False)
         monkeypatch.setattr(module, "execute", fake.execute, raising=False)
