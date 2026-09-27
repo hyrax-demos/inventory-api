@@ -10,7 +10,9 @@ def test_sync_prices_requires_admin_token(client, fake_db):
 
 
 def test_sync_single_item_happy_path(client, fake_db):
-    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=1, price=1.0, tenant_id="tenant-a")
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=1, price=1.0, tenant_id="tenant-a"
+    )
     resp = client.post(
         "/sync/item/WIDGET",
         params={"warehouse_id": "w1", "price": 9.99},
@@ -31,13 +33,77 @@ def test_sync_single_item_not_found(client, fake_db):
 
 def test_release_reservation_happy_path(client, fake_db):
     fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
-    fake_db.add_reservation(order_id="order-1", tenant_id="tenant-a", sku="WIDGET", warehouse_id="w1", quantity=3)
-    resp = client.post("/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"})
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
     assert resp.status_code == 200
     assert resp.json()["released"] == 3
     assert fake_db.items[0]["quantity"] == 8
 
 
 def test_release_reservation_not_found(client, fake_db):
-    resp = client.post("/reservations/does-not-exist/release", headers={"X-Tenant-Id": "tenant-a"})
+    resp = client.post(
+        "/reservations/does-not-exist/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
     assert resp.status_code == 404
+
+
+def test_release_reservation_restores_stock_and_removes_reservation(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"order_id": "order-1", "released": 3}
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
+
+
+def test_release_reservation_restore_failure_keeps_reservation_and_stock(
+    client, fake_db, monkeypatch
+):
+    from app.routes import sync as sync_routes
+
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("stock restore failed")
+
+    monkeypatch.setattr(sync_routes, "_restore_reservation_stock", boom)
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 500
+    assert resp.json()["detail"] == "failed to release reservation"
+    assert fake_db.items[0]["quantity"] == 5
+    assert fake_db.reservations == [
+        {
+            "order_id": "order-1",
+            "tenant_id": "tenant-a",
+            "sku": "WIDGET",
+            "warehouse_id": "w1",
+            "quantity": 3,
+        }
+    ]
