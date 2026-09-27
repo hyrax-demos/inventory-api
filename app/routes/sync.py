@@ -107,5 +107,12 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
             (order_id, x_tenant_id),
         )
 
-    cache.invalidate(cache.stock_key(locked["sku"]))
+    # Invalidate the exact key GET /items/{sku}/stock reads/writes for this
+    # reservation's tenant + warehouse + sku, using the values from the row
+    # that was actually released (not from the request), and only after the
+    # transaction above has committed -- so a concurrent read can't re-cache
+    # the stale quantity in the window between the write and the invalidate.
+    cache.invalidate(
+        cache.stock_cache_key(x_tenant_id, locked["warehouse_id"], sku=locked["sku"])
+    )
     return {"order_id": order_id, "released": locked["quantity"]}

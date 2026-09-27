@@ -3,6 +3,8 @@ import os
 import pytest
 
 TENANT_A = {"X-Tenant-Id": "tenant-a", "X-Admin-Token": os.environ["ADMIN_TOKEN"]}
+TENANT_A_HEADER = {"X-Tenant-Id": "tenant-a"}
+TENANT_B_HEADER = {"X-Tenant-Id": "tenant-b"}
 
 
 def test_sync_prices_requires_admin_token(client, fake_db):
@@ -184,3 +186,75 @@ def test_release_reservation_called_twice_stock_delta_matches_quantity_once(
 
     after = fake_db.items[0]["quantity"]
     assert after - before == 4
+
+
+def test_release_reservation_invalidates_cached_stock_read(client, fake_db):
+    """Populate the real stock cache via GET /items/{sku}/stock, release the
+    reservation, and check that a subsequent GET returns the freshly
+    restored quantity instead of the value cached before the release."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+
+    # Fill the cache with the pre-release quantity.
+    before = client.get(
+        "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A_HEADER
+    )
+    assert before.status_code == 200
+    assert before.json()["quantity"] == 5
+
+    release = client.post("/reservations/order-1/release", headers=TENANT_A_HEADER)
+    assert release.status_code == 200
+    assert release.json()["released"] == 3
+
+    after = client.get(
+        "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A_HEADER
+    )
+    assert after.status_code == 200
+    assert after.json()["quantity"] == 8
+
+
+def test_release_reservation_does_not_disturb_other_skus_cached_stock(client, fake_db):
+    """Releasing tenant-a's reservation for WIDGET/w1 must only invalidate
+    that SKU's cache entry -- a different SKU's cached stock read (for
+    another tenant, another warehouse, or both) must keep returning its own
+    correct, unaffected value."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_item(sku="GADGET", warehouse_id="w2", quantity=20, tenant_id="tenant-a")
+    fake_db.add_item(sku="GIZMO", warehouse_id="w1", quantity=50, tenant_id="tenant-b")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+
+    # Warm the cache for two unrelated SKUs before releasing tenant-a's
+    # WIDGET reservation.
+    other_warehouse = client.get(
+        "/items/GADGET/stock", params={"warehouse_id": "w2"}, headers=TENANT_A_HEADER
+    )
+    other_tenant = client.get(
+        "/items/GIZMO/stock", params={"warehouse_id": "w1"}, headers=TENANT_B_HEADER
+    )
+    assert other_warehouse.json()["quantity"] == 20
+    assert other_tenant.json()["quantity"] == 50
+
+    release = client.post("/reservations/order-1/release", headers=TENANT_A_HEADER)
+    assert release.status_code == 200
+
+    # Both unrelated reads still return their own correct, cached values.
+    other_warehouse_after = client.get(
+        "/items/GADGET/stock", params={"warehouse_id": "w2"}, headers=TENANT_A_HEADER
+    )
+    other_tenant_after = client.get(
+        "/items/GIZMO/stock", params={"warehouse_id": "w1"}, headers=TENANT_B_HEADER
+    )
+    assert other_warehouse_after.json()["quantity"] == 20
+    assert other_tenant_after.json()["quantity"] == 50
