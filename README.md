@@ -33,7 +33,8 @@ uvicorn app.main:app --reload
 | GET    | `/reports/reserved-value`       | Dollar value of reserved stock       |
 | POST   | `/reports/import`               | Bulk-import a stock snapshot          |
 | POST   | `/admin/items/reset`            | Reset all stock to zero (internal)   |
-| DELETE | `/admin/items/{item_id}`        | Delete a discontinued SKU            |
+| DELETE | `/admin/items/{sku}`            | Soft-delete a SKU (tenant-scoped)    |
+| POST   | `/admin/items/{sku}/restore`    | Restore a soft-deleted SKU           |
 | POST   | `/admin/items/{item_id}/update` | Patch whitelisted item fields        |
 | POST   | `/admin/items/bulk-adjust`      | Apply stock deltas in bulk           |
 | POST   | `/sync/prices`                  | Sync prices from the provider feed   |

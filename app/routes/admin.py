@@ -2,13 +2,21 @@
 
 All endpoints require the shared admin token (``require_admin``) and are scoped
 to the caller's tenant.
+
+Note: ``app.auth`` provides no tenant-resolution helper. The tenant comes from the
+``X-Tenant-Id`` header, and the admin token is shared rather than bound to a
+tenant. The soft-delete/restore routes resolve the tenant with the repo's
+existing resolver (``app.routes.items._tenant``), which rejects an empty tenant.
 """
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache
 from app.auth import require_admin
 from app.db import execute
 from app.models import ItemUpdate, StockAdjustment
+from app.queries import restore_item, soft_delete_item
+from app.routes.items import _tenant
 
 router = APIRouter(dependencies=[Depends(require_admin)])
 
@@ -22,25 +30,27 @@ def reset_inventory(x_tenant_id: str = Header()):
     return {"reset": True}
 
 
-@router.delete("/admin/items/{item_id}")
-def delete_item(item_id: str, x_tenant_id: str = Header()):
-    """Delete an item by id, scoped to the caller's tenant."""
-    affected = execute(
-        "DELETE FROM items WHERE id = %s AND tenant_id = %s",
-        (item_id, x_tenant_id),
-    )
-    if affected == 0:
+@router.delete("/admin/items/{sku}")
+def delete_item(sku: str, tenant_id: str = Depends(_tenant)):
+    """Soft-delete a live item by sku, scoped to the caller's tenant."""
+    if not soft_delete_item(tenant_id, sku):
         raise HTTPException(status_code=404, detail="not found")
-    return {"deleted": item_id}
+    return {"deleted": sku}
+
+
+@router.post("/admin/items/{sku}/restore")
+def restore_deleted_item(sku: str, tenant_id: str = Depends(_tenant)):
+    """Undo a soft-delete by sku, scoped to the caller's tenant."""
+    if not restore_item(tenant_id, sku):
+        raise HTTPException(status_code=404, detail="not found")
+    return {"restored": sku}
 
 
 @router.post("/admin/items/{item_id}/update")
 def update_item(item_id: str, patch: ItemUpdate, x_tenant_id: str = Header()):
     """Apply a partial update to an item using only whitelisted columns."""
     fields = {
-        k: v
-        for k, v in patch.model_dump(exclude_unset=True).items()
-        if k in _PATCHABLE
+        k: v for k, v in patch.model_dump(exclude_unset=True).items() if k in _PATCHABLE
     }
     if not fields:
         raise HTTPException(status_code=400, detail="no patchable fields")
