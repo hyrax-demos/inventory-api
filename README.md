@@ -29,6 +29,7 @@ uvicorn app.main:app --reload
 | GET    | `/items/{sku}/stock`            | On-hand quantity (cached)            |
 | POST   | `/items/reserve`                | Reserve stock for an order           |
 | GET    | `/reports/low-stock`            | Items at/below reorder threshold     |
+| GET    | `/reports/low-stock.csv`        | Low-stock report as CSV (see below)  |
 | GET    | `/reports/today`                | Stock movements recorded today       |
 | GET    | `/reports/reserved-value`       | Dollar value of reserved stock       |
 | POST   | `/reports/import`               | Bulk-import a stock snapshot          |
@@ -41,3 +42,51 @@ uvicorn app.main:app --reload
 | POST   | `/reservations/{order_id}/release` | Release a reservation             |
 
 Admin and sync endpoints require the `X-Admin-Token` header.
+
+### Low-stock CSV export
+
+`GET /reports/low-stock.csv` returns the same rows as `GET /reports/low-stock`,
+as CSV. Both endpoints use the same query, so tenant scoping, threshold filtering
+and ordering are identical. The CSV endpoint additionally accepts an optional
+`warehouse_id` filter.
+
+- **Tenant header:** `X-Tenant-Id` (required). Rows come only from this tenant.
+- **Query parameter:** `threshold` (integer, default `10`). An item is included
+  when `quantity <= threshold`. Rows are sorted by `quantity`, lowest first.
+- **Query parameter:** `warehouse_id` (string, optional, CSV endpoint only).
+  When set, only items in that warehouse are returned; an unknown warehouse
+  yields just the header row. Omitted or empty means all warehouses.
+- **Response:** `200` with a `text/csv` Content-Type, UTF-8 encoded. The body
+  starts with the header row `sku,name,warehouse_id,quantity`, followed by one
+  row per low-stock item in that column order. If no items match, the body is
+  just the header row.
+- **Quoting:** fields are written with Python's `csv` module and quoted per
+  RFC 4180. A field that contains a comma, a double quote, or a newline (CR/LF)
+  is wrapped in double quotes, and each embedded double quote is doubled
+  (`"` becomes `""`). Rows end with CRLF.
+- **Errors:** these match the JSON endpoint exactly.
+  - A missing `X-Tenant-Id` header returns `422` with FastAPI's validation
+    error body (`{"detail": [{"type": "missing", "loc": ["header", "x-tenant-id"], ...}]}`).
+  - A non-integer `threshold` also returns `422`.
+  - An empty or whitespace-only tenant value is not rejected. It is treated
+    as a tenant with no items, so the response contains only the header row.
+
+Example:
+
+```bash
+curl -s -H "X-Tenant-Id: acme" \
+  "http://localhost:8000/reports/low-stock.csv?threshold=5"
+```
+
+```csv
+sku,name,warehouse_id,quantity
+SKU-1042,"Bolt, ""M6"" x 20mm",wh-east,2
+SKU-0007,Washer,wh-west,5
+```
+
+To limit the export to one warehouse, add `warehouse_id`:
+
+```bash
+curl -s -H "X-Tenant-Id: acme" \
+  "http://localhost:8000/reports/low-stock.csv?threshold=5&warehouse_id=wh-east"
+```
