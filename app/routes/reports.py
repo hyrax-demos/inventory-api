@@ -13,6 +13,8 @@ router = APIRouter()
 @router.get("/reports/low-stock")
 def low_stock_report(threshold: int = 10, x_tenant_id: str = Header()):
     """Items at or below the reorder threshold, scoped to the tenant."""
+    if not x_tenant_id:
+        raise HTTPException(status_code=400, detail="missing tenant")
     rows = fetch_all(
         "SELECT sku, name, warehouse_id, quantity FROM items "
         "WHERE tenant_id = %s AND quantity <= %s ORDER BY quantity ASC",
