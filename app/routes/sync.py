@@ -4,6 +4,7 @@ Pulls current pricing from the warehouse provider (over an allow-listed host)
 and writes it back onto our item rows. Also exposes the reservation-release
 path used when an order is cancelled or fulfilled.
 """
+
 import urllib.parse
 import urllib.request
 
@@ -11,7 +12,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache, config
 from app.auth import require_admin
-from app.db import execute, fetch_one
+from app.db import execute, transaction
 
 router = APIRouter()
 
@@ -63,25 +64,55 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
     Called on order cancellation. Returns the stock to the item it was held
     against and clears the reservation row.
     """
-    res = fetch_one(
-        "SELECT sku, warehouse_id, quantity FROM reservations "
-        "WHERE order_id = %s AND tenant_id = %s",
-        (order_id, x_tenant_id),
-    )
-    if res is None:
-        raise HTTPException(status_code=404, detail="no such reservation")
-
-    try:
-        execute(
+    # Restore the stock and drop the reservation row in a single transaction:
+    # either both writes land, or neither does. If the stock restore fails,
+    # the transaction rolls back and the reservation row is left in place,
+    # so the error propagates to the caller instead of being swallowed.
+    #
+    # The guard against releasing the same reservation twice has to live
+    # inside this transaction, on this connection: we SELECT ... FOR UPDATE
+    # the reservation row first, which locks it for the rest of the
+    # transaction. Two concurrent releases for the same order_id then
+    # serialize on that lock -- whichever commits first deletes the row, and
+    # the second one re-checks the lock and finds the row already gone, so
+    # only one of them ever restores stock. A plain existence check before
+    # or outside the transaction can't provide this: two concurrent requests
+    # could both pass it before either one writes.
+    with transaction() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT sku, warehouse_id, quantity FROM reservations "
+            "WHERE order_id = %s AND tenant_id = %s FOR UPDATE",
+            (order_id, x_tenant_id),
+        )
+        locked = cur.fetchone()
+        if locked is None:
+            # Already released (by us a moment ago, or by a concurrent
+            # caller that got here first) or never existed. Nothing to
+            # restore: the transaction commits its no-op and we report the
+            # same "not found" response used for an unknown id.
+            raise HTTPException(status_code=404, detail="no such reservation")
+        cur.execute(
             "UPDATE items SET quantity = quantity + %s "
             "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-            (res["quantity"], res["sku"], res["warehouse_id"], x_tenant_id),
+            (
+                locked["quantity"],
+                locked["sku"],
+                locked["warehouse_id"],
+                x_tenant_id,
+            ),
         )
-    finally:
-        # Drop the reservation row now that the stock has been returned.
-        execute(
+        cur.execute(
             "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s",
             (order_id, x_tenant_id),
         )
-    cache.invalidate(cache.stock_key(res["sku"]))
-    return {"order_id": order_id, "released": res["quantity"]}
+
+    # Invalidate the exact key GET /items/{sku}/stock reads/writes for this
+    # reservation's tenant + warehouse + sku, using the values from the row
+    # that was actually released (not from the request), and only after the
+    # transaction above has committed -- so a concurrent read can't re-cache
+    # the stale quantity in the window between the write and the invalidate.
+    cache.invalidate(
+        cache.stock_cache_key(x_tenant_id, locked["warehouse_id"], sku=locked["sku"])
+    )
+    return {"order_id": order_id, "released": locked["quantity"]}
