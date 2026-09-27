@@ -1,3 +1,5 @@
+import pytest
+
 TENANT_A = {"X-Tenant-Id": "tenant-a"}
 TENANT_B = {"X-Tenant-Id": "tenant-b"}
 
@@ -126,3 +128,44 @@ def test_reserve_stock_missing_item(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 404
+
+
+def _walk_pages(client, params):
+    seen, cursor = [], None
+    for _ in range(100):
+        p = dict(params)
+        if cursor:
+            p["cursor"] = cursor
+        resp = client.get("/items", params=p, headers=TENANT_A)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["items"]) <= params["limit"]
+        seen.extend(i["id"] for i in body["items"])
+        cursor = body["next_cursor"]
+        if cursor is None:
+            return seen
+    raise AssertionError("pagination did not terminate")
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 4, 5, 6])
+def test_search_items_pagination_returns_each_item_once(client, fake_db, limit):
+    expected = []
+    for i in range(7):
+        wh = "w1" if i % 3 else "w2"
+        row = fake_db.add_item(sku=f"S{i}", name=f"widget {i}", warehouse_id=wh, quantity=1, tenant_id="tenant-a")
+        if wh == "w1":
+            expected.append(row["id"])
+        fake_db.add_item(sku=f"O{i}", name=f"widget {i}", warehouse_id="w1", quantity=1, tenant_id="tenant-b")
+        fake_db.add_item(sku=f"G{i}", name=f"gadget {i}", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    seen = _walk_pages(client, {"limit": limit, "warehouse_id": "w1", "q": "widget"})
+    assert seen == sorted(expected)
+    assert len(seen) == len(set(seen))
+
+
+def test_search_items_exact_multiple_has_no_trailing_page(client, fake_db):
+    for i in range(4):
+        fake_db.add_item(sku=f"S{i}", name="x", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    body = client.get("/items", params={"limit": 2}, headers=TENANT_A).json()
+    body2 = client.get("/items", params={"limit": 2, "cursor": body["next_cursor"]}, headers=TENANT_A).json()
+    assert len(body2["items"]) == 2
+    assert body2["next_cursor"] is None
