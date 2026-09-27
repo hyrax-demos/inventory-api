@@ -23,7 +23,7 @@ def test_low_stock_report_scoped_to_tenant(client, fake_db):
 
 def test_todays_movements_returns_recent_entries(client, fake_db):
     fake_db.add_movement(
-        sku="WIDGET", warehouse_id="w1", delta=-2, created_at=datetime.now(), tenant_id="tenant-a"
+        sku="WIDGET", warehouse_id="w1", delta=-2, created_at=datetime.now(timezone.utc), tenant_id="tenant-a"
     )
     resp = client.get("/reports/today", headers=TENANT_A)
     assert resp.status_code == 200
@@ -34,7 +34,7 @@ def test_todays_movements_returns_recent_entries(client, fake_db):
 
 def test_todays_movements_scoped_to_tenant(client, fake_db):
     fake_db.add_movement(
-        sku="WIDGET", warehouse_id="w1", delta=-2, created_at=datetime.now(), tenant_id="tenant-b"
+        sku="WIDGET", warehouse_id="w1", delta=-2, created_at=datetime.now(timezone.utc), tenant_id="tenant-b"
     )
     resp = client.get("/reports/today", headers=TENANT_A)
     assert resp.status_code == 200
