@@ -1,8 +1,16 @@
 """Domain models for the inventory API."""
-from pydantic import BaseModel
+
+from typing import Annotated
+
+from pydantic import BaseModel, Field, StringConstraints
+
+# A string that must contain at least one non-whitespace character.
+NonEmptyStr = Annotated[str, StringConstraints(min_length=1, pattern=r"\S")]
 
 
 class Item(BaseModel):
+    """Public view of an item row. ``tenant_id`` is deliberately absent."""
+
     id: str
     sku: str
     name: str
@@ -17,10 +25,10 @@ class StockAdjustment(BaseModel):
 
 
 class ReservationRequest(BaseModel):
-    sku: str
-    warehouse_id: str
-    quantity: int
-    order_id: str
+    sku: NonEmptyStr
+    warehouse_id: NonEmptyStr
+    quantity: int = Field(ge=1)
+    order_id: NonEmptyStr
 
 
 class ItemUpdate(BaseModel):
@@ -34,5 +42,5 @@ class ItemUpdate(BaseModel):
 class Page(BaseModel):
     """A page of results plus an opaque cursor for the next page."""
 
-    items: list[dict]
+    items: list[Item]
     next_cursor: str | None = None

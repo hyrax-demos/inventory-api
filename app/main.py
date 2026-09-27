@@ -1,8 +1,11 @@
 from fastapi import FastAPI
 
+from app import cache, config
+from app.request_logging import RequestLoggingMiddleware
 from app.routes import admin, items, reports, sync
 
 app = FastAPI(title="inventory-api")
+app.add_middleware(RequestLoggingMiddleware)
 
 app.include_router(items.router)
 app.include_router(reports.router)
@@ -13,3 +16,12 @@ app.include_router(sync.router)
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/health/details")
+def health_details():
+    return {
+        "status": "ok",
+        "version": config.VERSION,
+        "cache_entries": cache.live_count(),
+    }
