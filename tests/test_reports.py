@@ -1,4 +1,10 @@
-from datetime import datetime
+import os
+import time
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from app.routes import reports as reports_routes
 
 TENANT_A = {"X-Tenant-Id": "tenant-a"}
 
@@ -23,7 +29,7 @@ def test_low_stock_report_scoped_to_tenant(client, fake_db):
 
 def test_todays_movements_returns_recent_entries(client, fake_db):
     fake_db.add_movement(
-        sku="WIDGET", warehouse_id="w1", delta=-2, created_at=datetime.now(), tenant_id="tenant-a"
+        sku="WIDGET", warehouse_id="w1", delta=-2, created_at=datetime.now(timezone.utc), tenant_id="tenant-a"
     )
     resp = client.get("/reports/today", headers=TENANT_A)
     assert resp.status_code == 200
@@ -34,7 +40,7 @@ def test_todays_movements_returns_recent_entries(client, fake_db):
 
 def test_todays_movements_scoped_to_tenant(client, fake_db):
     fake_db.add_movement(
-        sku="WIDGET", warehouse_id="w1", delta=-2, created_at=datetime.now(), tenant_id="tenant-b"
+        sku="WIDGET", warehouse_id="w1", delta=-2, created_at=datetime.now(timezone.utc), tenant_id="tenant-b"
     )
     resp = client.get("/reports/today", headers=TENANT_A)
     assert resp.status_code == 200
@@ -79,3 +85,96 @@ def test_import_snapshot_rejects_malformed_entry(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 400
+
+
+# --- UTC day boundary for /reports/today ---
+
+
+def test_utc_start_of_day_is_aware_utc_midnight():
+    now = datetime(2024, 3, 10, 15, 42, 7, 123456, tzinfo=timezone.utc)
+    start = reports_routes.utc_start_of_day(now)
+    assert start == datetime(2024, 3, 10, tzinfo=timezone.utc)
+    assert start.utcoffset() == timedelta(0)
+
+
+def test_utc_start_of_day_uses_utc_calendar_date_not_local():
+    # 20:00 at UTC-05:00 on Mar 9 is 01:00 UTC on Mar 10.
+    now = datetime(2024, 3, 9, 20, 0, tzinfo=timezone(timedelta(hours=-5)))
+    assert reports_routes.utc_start_of_day(now) == datetime(2024, 3, 10, tzinfo=timezone.utc)
+    # 03:00 at UTC+09:00 on Mar 10 is 18:00 UTC on Mar 9.
+    now = datetime(2024, 3, 10, 3, 0, tzinfo=timezone(timedelta(hours=9)))
+    assert reports_routes.utc_start_of_day(now) == datetime(2024, 3, 9, tzinfo=timezone.utc)
+
+
+def test_utc_start_of_day_rejects_naive_datetime():
+    with pytest.raises(ValueError):
+        reports_routes.utc_start_of_day(datetime(2024, 3, 10, 12, 0))  # noqa: DTZ001
+
+
+def test_todays_movements_query_boundary_is_aware_utc_midnight(client, fake_db, monkeypatch):
+    fixed_now = datetime(2024, 3, 10, 1, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(reports_routes, "_utcnow", lambda: fixed_now)
+    captured = {}
+    original = fake_db.fetch_all
+
+    def spy(sql, params=()):
+        if "FROM movements" in sql:
+            captured["params"] = params
+        return original(sql, params)
+
+    monkeypatch.setattr(reports_routes, "fetch_all", spy)
+    resp = client.get("/reports/today", headers=TENANT_A)
+    assert resp.status_code == 200
+    _, boundary = captured["params"]
+    assert boundary.tzinfo is not None
+    assert boundary.utcoffset() == timedelta(0)
+    assert boundary == datetime(2024, 3, 10, tzinfo=timezone.utc)
+    assert resp.json()["date"] == "2024-03-10"
+
+
+def test_todays_movements_filters_on_utc_day(client, fake_db, monkeypatch):
+    fixed_now = datetime(2024, 3, 10, 1, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(reports_routes, "_utcnow", lambda: fixed_now)
+    # Stored in UTC: one just before UTC midnight, one just after.
+    fake_db.add_movement(
+        sku="YESTERDAY", warehouse_id="w1", delta=-1,
+        created_at=datetime(2024, 3, 9, 23, 59, 59, tzinfo=timezone.utc), tenant_id="tenant-a",
+    )
+    fake_db.add_movement(
+        sku="TODAY", warehouse_id="w1", delta=-1,
+        created_at=datetime(2024, 3, 10, 0, 0, 1, tzinfo=timezone.utc), tenant_id="tenant-a",
+    )
+    resp = client.get("/reports/today", headers=TENANT_A)
+    assert resp.status_code == 200
+    assert [m["sku"] for m in resp.json()["movements"]] == ["TODAY"]
+
+
+def test_todays_movements_independent_of_server_local_timezone(client, fake_db, monkeypatch):
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset not available on this platform")
+    fixed_now = datetime(2024, 3, 10, 1, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(reports_routes, "_utcnow", lambda: fixed_now)
+    fake_db.add_movement(
+        sku="LATE_UTC_YESTERDAY", warehouse_id="w1", delta=-1,
+        created_at=datetime(2024, 3, 9, 22, 0, tzinfo=timezone.utc), tenant_id="tenant-a",
+    )
+    fake_db.add_movement(
+        sku="EARLY_UTC_TODAY", warehouse_id="w1", delta=-1,
+        created_at=datetime(2024, 3, 10, 0, 30, tzinfo=timezone.utc), tenant_id="tenant-a",
+    )
+    original_tz = os.environ.get("TZ")
+    try:
+        for tz in ("America/New_York", "Asia/Tokyo", "UTC"):
+            os.environ["TZ"] = tz
+            time.tzset()
+            resp = client.get("/reports/today", headers=TENANT_A)
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["date"] == "2024-03-10"
+            assert [m["sku"] for m in body["movements"]] == ["EARLY_UTC_TODAY"]
+    finally:
+        if original_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original_tz
+        time.tzset()
