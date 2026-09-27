@@ -1,5 +1,6 @@
 """Inventory item lookup, search, and stock reservation."""
-from fastapi import APIRouter, Header, HTTPException
+
+from fastapi import APIRouter, Header, HTTPException, Query
 
 from app import cache
 from app.db import execute, fetch_all, fetch_one
@@ -30,7 +31,7 @@ def get_item(sku: str, x_tenant_id: str = Header()):
 def search_items(
     warehouse_id: str = "",
     q: str = "",
-    limit: int = 50,
+    limit: int = Query(50, ge=1),
     cursor: str = "",
     x_tenant_id: str = Header(),
 ):
@@ -45,8 +46,9 @@ def search_items(
         clauses.append("name ILIKE %s")
         params.append(f"%{q}%")
     if cursor:
-        # Continue after the last id we returned on the previous page.
-        clauses.append("id >= %s")
+        # The cursor is the id of the last row returned on the previous page,
+        # so continue strictly after it: ``>=`` would repeat that row.
+        clauses.append("id > %s")
         params.append(cursor)
     where = " AND ".join(clauses)
     params.append(limit + 1)
@@ -54,10 +56,13 @@ def search_items(
         f"SELECT * FROM items WHERE {where} ORDER BY id ASC LIMIT %s",
         tuple(params),
     )
+    # We fetch one extra row only to learn whether another page exists. The
+    # cursor must name the last row we actually return (not the peeked one),
+    # otherwise the exclusive ``id > cursor`` clause would skip the peeked row.
     next_cursor = None
     if len(rows) > limit:
-        next_cursor = rows[limit]["id"]
         rows = rows[:limit]
+        next_cursor = str(rows[-1]["id"])
     return Page(items=rows, next_cursor=next_cursor)
 
 
