@@ -4,6 +4,7 @@ Stock and price reads dominate traffic and the underlying rows change slowly,
 so we memoize them for a few seconds to take load off Postgres. Entries expire
 on read once they pass their TTL.
 """
+
 import json
 import time
 
@@ -58,7 +59,7 @@ def invalidate_stock_for_sku(tenant_id: str, sku: str) -> None:
     for key in list(_store):
         if not key.startswith(_STOCK_PREFIX):
             continue
-        k_tenant, _k_warehouse, k_sku = json.loads(key[len(_STOCK_PREFIX):])
+        k_tenant, _k_warehouse, k_sku = json.loads(key[len(_STOCK_PREFIX) :])
         if k_tenant == tenant_id and k_sku == sku:
             _store.pop(key, None)
 
