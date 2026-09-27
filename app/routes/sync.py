@@ -4,14 +4,16 @@ Pulls current pricing from the warehouse provider (over an allow-listed host)
 and writes it back onto our item rows. Also exposes the reservation-release
 path used when an order is cancelled or fulfilled.
 """
+
 import urllib.parse
 import urllib.request
 
+import psycopg2.extras
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache, config
 from app.auth import require_admin
-from app.db import execute, fetch_one
+from app.db import execute, execute_in, transaction
 
 router = APIRouter()
 
@@ -56,32 +58,71 @@ def sync_single_item(
     return {"sku": sku, "warehouse_id": warehouse_id, "price": price}
 
 
+def _claim_reservation(conn, order_id: str, tenant_id: str):
+    """Lock and return a reservation row inside ``conn``'s transaction.
+
+    ``FOR UPDATE`` makes a concurrent release of the same reservation block
+    until this transaction finishes. Once it commits (row deleted), the waiter
+    re-checks the row, finds nothing, and so never restores stock a second
+    time. Returns ``None`` if there is no such reservation.
+    """
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "SELECT sku, warehouse_id, quantity FROM reservations "
+        "WHERE order_id = %s AND tenant_id = %s FOR UPDATE",
+        (order_id, tenant_id),
+    )
+    return cur.fetchone()
+
+
+def _restore_reservation_stock(conn, res: dict, tenant_id: str) -> int:
+    """Return a reservation's quantity to its item's on-hand stock."""
+    return execute_in(
+        conn,
+        "UPDATE items SET quantity = quantity + %s "
+        "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
+        (res["quantity"], res["sku"], res["warehouse_id"], tenant_id),
+    )
+
+
+def _delete_reservation(conn, order_id: str, tenant_id: str) -> int:
+    """Drop a reservation row."""
+    return execute_in(
+        conn,
+        "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s",
+        (order_id, tenant_id),
+    )
+
+
 @router.post("/reservations/{order_id}/release")
 def release_reservation(order_id: str, x_tenant_id: str = Header()):
     """Release a reservation, returning its quantity to on-hand stock.
 
     Called on order cancellation. Returns the stock to the item it was held
-    against and clears the reservation row.
+    against and clears the reservation row. The claim (row lock), the stock
+    restore and the delete all run in one transaction: if any step fails,
+    nothing is applied and the reservation stays so the release can be
+    retried. Releasing an already-released (or unknown) reservation restores
+    nothing and returns 404, even when two releases race.
     """
-    res = fetch_one(
-        "SELECT sku, warehouse_id, quantity FROM reservations "
-        "WHERE order_id = %s AND tenant_id = %s",
-        (order_id, x_tenant_id),
-    )
+    try:
+        with transaction() as conn:
+            res = _claim_reservation(conn, order_id, x_tenant_id)
+            if res is not None:
+                _restore_reservation_stock(conn, res, x_tenant_id)
+                if _delete_reservation(conn, order_id, x_tenant_id) != 1:
+                    # Should be impossible while we hold the row lock. Roll
+                    # back rather than keep a restore with no matching delete.
+                    raise RuntimeError("reservation vanished while locked")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail="failed to release reservation"
+        ) from exc
+
     if res is None:
         raise HTTPException(status_code=404, detail="no such reservation")
 
-    try:
-        execute(
-            "UPDATE items SET quantity = quantity + %s "
-            "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-            (res["quantity"], res["sku"], res["warehouse_id"], x_tenant_id),
-        )
-    finally:
-        # Drop the reservation row now that the stock has been returned.
-        execute(
-            "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s",
-            (order_id, x_tenant_id),
-        )
-    cache.invalidate(cache.stock_key(res["sku"]))
+    # Only reached after a successful commit that restored stock. Invalidate
+    # the exact key GET /items/{sku}/stock reads for this tenant+warehouse+sku.
+    cache.invalidate(cache.stock_key(x_tenant_id, res["warehouse_id"], res["sku"]))
     return {"order_id": order_id, "released": res["quantity"]}

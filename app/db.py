@@ -4,6 +4,7 @@ Connections are short-lived: each helper opens, runs, and closes its own
 connection. All SQL is parameterized -- callers pass values via ``params``,
 never via string interpolation.
 """
+
 from contextlib import contextmanager
 
 import psycopg2
@@ -52,9 +53,18 @@ def fetch_one(sql: str, params: tuple = ()):
     return rows[0] if rows else None
 
 
+def execute_in(conn, sql: str, params: tuple = ()):
+    """Run a write statement on ``conn`` without committing; return rowcount.
+
+    Use inside ``with transaction() as conn:`` so several statements share
+    one transaction and commit (or roll back) together.
+    """
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    return cur.rowcount
+
+
 def execute(sql: str, params: tuple = ()):
     """Run a write statement in its own transaction; return affected rowcount."""
     with transaction() as conn:
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        return cur.rowcount
+        return execute_in(conn, sql, params)
