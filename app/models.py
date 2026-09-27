@@ -9,6 +9,8 @@ NonEmptyStr = Annotated[str, StringConstraints(min_length=1, pattern=r"\S")]
 
 
 class Item(BaseModel):
+    """Public view of an item row. ``tenant_id`` is deliberately absent."""
+
     id: str
     sku: str
     name: str
@@ -40,5 +42,5 @@ class ItemUpdate(BaseModel):
 class Page(BaseModel):
     """A page of results plus an opaque cursor for the next page."""
 
-    items: list[dict]
+    items: list[Item]
     next_cursor: str | None = None

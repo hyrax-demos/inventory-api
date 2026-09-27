@@ -7,18 +7,24 @@ from fastapi import APIRouter, Header, HTTPException
 
 from app.repositories import items as items_repo
 from app.repositories import reports as reports_repo
+from app.schemas import (
+    ImportSnapshotResponse,
+    LowStockReport,
+    MovementsReport,
+    ReservedValueReport,
+)
 
 router = APIRouter()
 
 
-@router.get("/reports/low-stock")
+@router.get("/reports/low-stock", response_model=LowStockReport)
 def low_stock_report(threshold: int = 10, x_tenant_id: str = Header()):
     """Items at or below the reorder threshold, scoped to the tenant."""
     rows = reports_repo.low_stock(x_tenant_id, threshold)
     return {"threshold": threshold, "items": rows}
 
 
-@router.get("/reports/today")
+@router.get("/reports/today", response_model=MovementsReport)
 def todays_movements(x_tenant_id: str = Header()):
     """Stock movements recorded so far today.
 
@@ -30,7 +36,7 @@ def todays_movements(x_tenant_id: str = Header()):
     return {"date": start_of_day.date().isoformat(), "movements": rows}
 
 
-@router.get("/reports/reserved-value")
+@router.get("/reports/reserved-value", response_model=ReservedValueReport)
 def reserved_value(x_tenant_id: str = Header()):
     """Total dollar value of stock currently reserved, by SKU.
 
@@ -40,7 +46,7 @@ def reserved_value(x_tenant_id: str = Header()):
     return {"lines": rows}
 
 
-@router.post("/reports/import")
+@router.post("/reports/import", response_model=ImportSnapshotResponse)
 async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
     """Bulk-import a stock snapshot.
 

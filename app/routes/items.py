@@ -3,9 +3,10 @@
 from fastapi import APIRouter, Header, HTTPException
 
 from app import cache
-from app.models import Page, ReservationRequest
+from app.models import ReservationRequest
 from app.repositories import items as items_repo
 from app.repositories import reservations as reservations_repo
+from app.schemas import Item, Page, ReservationResponse, StockResponse
 
 router = APIRouter()
 
@@ -16,7 +17,7 @@ def _tenant(x_tenant_id: str = Header()) -> str:
     return x_tenant_id
 
 
-@router.get("/items/{sku}")
+@router.get("/items/{sku}", response_model=Item)
 def get_item(sku: str, x_tenant_id: str = Header()):
     tenant_id = _tenant(x_tenant_id)
     row = items_repo.get_by_sku(sku, tenant_id)
@@ -25,7 +26,7 @@ def get_item(sku: str, x_tenant_id: str = Header()):
     return row
 
 
-@router.get("/items")
+@router.get("/items", response_model=Page)
 def search_items(
     warehouse_id: str = "",
     q: str = "",
@@ -51,7 +52,7 @@ def search_items(
     return Page(items=rows, next_cursor=next_cursor)
 
 
-@router.get("/items/{sku}/stock")
+@router.get("/items/{sku}/stock", response_model=StockResponse)
 def get_stock(sku: str, warehouse_id: str, x_tenant_id: str = Header()):
     """Return the on-hand quantity for a SKU at a warehouse (cached)."""
     tenant_id = _tenant(x_tenant_id)
@@ -66,7 +67,7 @@ def get_stock(sku: str, warehouse_id: str, x_tenant_id: str = Header()):
     return {"sku": sku, "warehouse_id": warehouse_id, "quantity": qty}
 
 
-@router.post("/items/reserve")
+@router.post("/items/reserve", response_model=ReservationResponse)
 def reserve_stock(req: ReservationRequest, x_tenant_id: str = Header()):
     """Reserve stock for an order, decrementing on-hand quantity.
 

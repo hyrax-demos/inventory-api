@@ -14,6 +14,11 @@ from app import cache, config
 from app.auth import require_admin
 from app.repositories import items as items_repo
 from app.repositories import reservations as reservations_repo
+from app.schemas import (
+    ReleaseReservationResponse,
+    SyncItemResponse,
+    SyncPricesResponse,
+)
 
 router = APIRouter()
 
@@ -33,7 +38,11 @@ def _provider_url(host: str) -> str:
     return urllib.parse.urlunparse(parsed._replace(path="/v1/prices", query=query))
 
 
-@router.post("/sync/prices", dependencies=[Depends(require_admin)])
+@router.post(
+    "/sync/prices",
+    response_model=SyncPricesResponse,
+    dependencies=[Depends(require_admin)],
+)
 def sync_prices(provider_host: str = ""):
     """Sync prices for every SKU from the provider feed."""
     url = _provider_url(provider_host)
@@ -42,7 +51,11 @@ def sync_prices(provider_host: str = ""):
     return {"synced": True, "bytes": len(feed)}
 
 
-@router.post("/sync/item/{sku}", dependencies=[Depends(require_admin)])
+@router.post(
+    "/sync/item/{sku}",
+    response_model=SyncItemResponse,
+    dependencies=[Depends(require_admin)],
+)
 def sync_single_item(
     sku: str, warehouse_id: str, price: float, x_tenant_id: str = Header()
 ):
@@ -54,7 +67,9 @@ def sync_single_item(
     return {"sku": sku, "warehouse_id": warehouse_id, "price": price}
 
 
-@router.post("/reservations/{order_id}/release")
+@router.post(
+    "/reservations/{order_id}/release", response_model=ReleaseReservationResponse
+)
 def release_reservation(order_id: str, x_tenant_id: str = Header()):
     """Release a reservation, returning its quantity to on-hand stock.
 
