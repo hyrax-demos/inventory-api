@@ -104,11 +104,23 @@ class _TxCursor:
         self._fake_db = fake_db
         self._fail_on = fail_on
         self.rowcount = 0
+        self._rows: list = []
 
     def execute(self, sql, params=()):
         if self._fail_on and sql.startswith(self._fail_on):
             raise RuntimeError(f"simulated DB failure on {self._fail_on!r}")
-        self.rowcount = self._fake_db.execute(sql, params)
+        if "RETURNING" in sql:
+            self._rows = self._fake_db.execute_returning(sql, params)
+            self.rowcount = len(self._rows)
+        else:
+            self._rows = []
+            self.rowcount = self._fake_db.execute(sql, params)
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return self._rows
 
 
 class _TxHarness:
@@ -202,3 +214,91 @@ def test_release_reservation_failure_rolls_back_and_keeps_reservation(
     assert "rollback" in tx_events
     assert "commit" not in tx_events
     assert not any(e.startswith("invalidate:") for e in tx_events)
+
+
+# -- idempotent release -----------------------------------------------------
+#
+# Chosen convention: a second release of the same reservation (or a release of
+# one that never existed for this tenant) returns 404 "no such reservation",
+# matching the route's existing not-found response, and never touches stock.
+# The in-transaction DELETE ... RETURNING is the guard: stock is restored only
+# by the call whose DELETE actually removed the row.
+
+
+def test_release_reservation_twice_restores_stock_exactly_once(fake_db, tx):
+    _seed_reservation(fake_db)
+    client = TestClient(app)
+
+    first = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert first.status_code == 200
+    assert first.json() == {"order_id": "order-1", "released": 3}
+    assert fake_db.items[0]["quantity"] == 8
+    events_after_first = list(tx.events)
+
+    second = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert second.status_code == 404
+    assert second.json() == {"detail": "no such reservation"}
+    # Stock went up by the reserved quantity exactly once.
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
+    # The second call committed nothing and invalidated no cache entry.
+    second_events = tx.events[len(events_after_first) :]
+    assert "commit" not in second_events
+    assert not any(e.startswith("invalidate:") for e in second_events)
+
+
+def test_release_reservation_twice_with_default_fake(client, fake_db):
+    _seed_reservation(fake_db)
+    headers = {"X-Tenant-Id": "tenant-a"}
+
+    first = client.post("/reservations/order-1/release", headers=headers)
+    assert first.status_code == 200
+    resp = client.post("/reservations/order-1/release", headers=headers)
+
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 8
+
+
+def test_release_nonexistent_reservation_changes_no_stock(fake_db, tx):
+    _seed_reservation(fake_db)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/reservations/no-such-order/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1
+    assert "commit" not in tx.events
+    assert not any(e.startswith("invalidate:") for e in tx.events)
+
+
+def test_release_other_tenants_reservation_is_rejected(fake_db, tx):
+    _seed_reservation(fake_db)  # order-1 belongs to tenant-a
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-b")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-b"}
+    )
+
+    assert resp.status_code == 404
+    # tenant-a's reservation is untouched, and neither tenant's stock moved.
+    assert fake_db.reservations == [
+        {
+            "order_id": "order-1",
+            "tenant_id": "tenant-a",
+            "sku": "WIDGET",
+            "warehouse_id": "w1",
+            "quantity": 3,
+        }
+    ]
+    stock = {i["tenant_id"]: i["quantity"] for i in fake_db.items}
+    assert stock == {"tenant-a": 5, "tenant-b": 10}
+    assert "commit" not in tx.events
+    assert not any(e.startswith("invalidate:") for e in tx.events)
