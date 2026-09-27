@@ -1,5 +1,6 @@
 """Inventory item lookup, search, and stock reservation."""
-from fastapi import APIRouter, Header, HTTPException
+
+from fastapi import APIRouter, Header, HTTPException, Query
 
 from app import cache
 from app.db import execute, fetch_all, fetch_one
@@ -30,11 +31,18 @@ def get_item(sku: str, x_tenant_id: str = Header()):
 def search_items(
     warehouse_id: str = "",
     q: str = "",
-    limit: int = 50,
+    limit: int = Query(50, ge=1),
     cursor: str = "",
     x_tenant_id: str = Header(),
 ):
-    """Search items, newest id last, with keyset pagination by id."""
+    """Search items, newest id last, with keyset pagination by id.
+
+    ``next_cursor`` is the id of the first row of the *next* page (we fetch
+    ``limit + 1`` rows and peek at the extra one), so the next request
+    resumes with an inclusive ``id >= cursor``. Each matching row is thus
+    returned exactly once across pages. ``limit`` must be at least 1: with
+    ``limit=0`` the cursor would never advance.
+    """
     tenant_id = _tenant(x_tenant_id)
     clauses = ["tenant_id = %s"]
     params: list = [tenant_id]
@@ -45,7 +53,8 @@ def search_items(
         clauses.append("name ILIKE %s")
         params.append(f"%{q}%")
     if cursor:
-        # Continue after the last id we returned on the previous page.
+        # The cursor is the first id of this page (the row the previous page
+        # peeked at but did not return), so the bound is inclusive.
         clauses.append("id >= %s")
         params.append(cursor)
     where = " AND ".join(clauses)
