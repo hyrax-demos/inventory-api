@@ -8,6 +8,7 @@ still owed) and the error must reach the caller.
 import pytest
 from fastapi.testclient import TestClient
 
+from app import cache as cache_module
 from app import db as db_module
 from app.main import app
 from app.routes import sync as sync_routes
@@ -251,3 +252,97 @@ def test_release_existence_check_is_inside_transaction(client, fake_db, monkeypa
 
     assert resp.status_code == 200
     assert fake_db.items[0]["quantity"] == 8
+
+
+# -- cache: a later GET /items/{sku}/stock sees the restored quantity --
+#
+# GET /items/{sku}/stock reads cache.stock_key(sku) == "stock:{sku}" (the key
+# carries neither tenant nor warehouse). release_reservation invalidates that
+# same key, via the same helper, only after its transaction has committed.
+
+
+def _stock(client, sku="WIDGET", warehouse_id="w1", headers=TENANT_A):
+    return client.get(
+        f"/items/{sku}/stock", params={"warehouse_id": warehouse_id}, headers=headers
+    )
+
+
+def test_release_invalidates_stock_cache_read_by_get(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="GADGET", warehouse_id="w1", quantity=4, tenant_id="tenant-a")
+
+    # Reserve through the API, then prime the cache with the reduced quantity.
+    reserve = client.post(
+        "/items/reserve",
+        json={
+            "sku": "WIDGET",
+            "warehouse_id": "w1",
+            "quantity": 3,
+            "order_id": "order-1",
+        },
+        headers=TENANT_A,
+    )
+    assert reserve.status_code == 200
+    assert _stock(client).json()["quantity"] == 7
+    assert _stock(client, sku="GADGET").json()["quantity"] == 4
+    assert cache_module.get(cache_module.stock_key("WIDGET")) == 7
+
+    resp = client.post("/reservations/order-1/release", headers=TENANT_A)
+    assert resp.status_code == 200
+
+    # The exact entry the GET handler reads is gone, so GET hits the DB.
+    assert cache_module.get(cache_module.stock_key("WIDGET")) is None
+    assert _stock(client).json()["quantity"] == 10
+    # An unrelated SKU's cache entry is untouched.
+    assert cache_module.get(cache_module.stock_key("GADGET")) == 4
+
+
+def test_release_with_seeded_reservation_refreshes_cached_stock(client, fake_db):
+    _seed(fake_db)
+    # Populate the cache before the release.
+    assert _stock(client).json()["quantity"] == 5
+
+    assert (
+        client.post("/reservations/order-1/release", headers=TENANT_A).status_code
+        == 200
+    )
+
+    assert _stock(client).json()["quantity"] == 8
+
+
+def test_failed_release_does_not_invalidate_stock_cache(
+    lenient_client, fake_db, monkeypatch
+):
+    """Invalidation happens only after commit: a rolled-back release leaves
+    the cached value in place (it is still correct)."""
+    _seed(fake_db)
+    assert _stock(lenient_client).json()["quantity"] == 5
+    real_execute = fake_db.execute
+
+    def failing_execute(sql, params=()):
+        if sql.startswith(RESTORE_SQL_PREFIX):
+            raise RuntimeError("simulated stock-restore failure")
+        return real_execute(sql, params)
+
+    monkeypatch.setattr(fake_db, "execute", failing_execute)
+    invalidated: list[str] = []
+    monkeypatch.setattr(cache_module, "invalidate", invalidated.append)
+
+    resp = lenient_client.post("/reservations/order-1/release", headers=TENANT_A)
+
+    assert resp.status_code == 500
+    assert invalidated == []
+    assert cache_module.get(cache_module.stock_key("WIDGET")) == 5
+
+
+def test_release_of_missing_reservation_does_not_invalidate(
+    client, fake_db, monkeypatch
+):
+    _seed(fake_db)
+    invalidated: list[str] = []
+    monkeypatch.setattr(cache_module, "invalidate", invalidated.append)
+
+    resp = client.post("/reservations/no-such-order/release", headers=TENANT_A)
+
+    assert resp.status_code == 404
+    assert invalidated == []
