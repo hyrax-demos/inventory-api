@@ -35,9 +35,23 @@ def invalidate(key: str) -> None:
     _store.pop(key, None)
 
 
-def stock_key(sku: str) -> str:
-    """Cache key for a SKU's stock snapshot."""
-    return f"stock:{sku}"
+def _part(value: str) -> str:
+    # Escape the delimiter so distinct (tenant, warehouse, sku) tuples can
+    # never collapse to the same key.
+    return str(value).replace("%", "%25").replace(":", "%3A")
+
+
+def stock_key(tenant_id: str, warehouse_id: str, sku: str) -> str:
+    """Cache key for a SKU's stock snapshot, scoped to tenant and warehouse."""
+    return f"stock:{_part(tenant_id)}:{_part(warehouse_id)}:{_part(sku)}"
+
+
+def invalidate_stock_for_sku(tenant_id: str, sku: str) -> None:
+    """Drop cached stock for a tenant's SKU across every warehouse."""
+    prefix = f"stock:{_part(tenant_id)}:"
+    suffix = f":{_part(sku)}"
+    for key in [k for k in _store if k.startswith(prefix) and k.endswith(suffix)]:
+        _store.pop(key, None)
 
 
 def price_key(sku: str, warehouse_id: str) -> str:
