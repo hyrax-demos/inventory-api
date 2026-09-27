@@ -126,3 +126,101 @@ def test_reserve_stock_missing_item(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 404
+
+
+def _walk_pages(client, headers, **params):
+    """Follow next_cursor until exhausted; return (ids in order, page count)."""
+    ids: list[str] = []
+    pages = 0
+    cursor = None
+    while True:
+        query = dict(params)
+        if cursor is not None:
+            query["cursor"] = cursor
+        resp = client.get("/items", params=query, headers=headers)
+        assert resp.status_code == 200
+        body = resp.json()
+        pages += 1
+        ids.extend(i["id"] for i in body["items"])
+        cursor = body["next_cursor"]
+        if cursor is None:
+            return ids, pages
+        assert pages < 100, "pagination did not terminate"
+
+
+def _seed_mixed(fake_db):
+    for i in range(23):
+        fake_db.add_item(
+            sku=f"SKU{i}",
+            name=f"item {i}" if i % 4 else f"gadget {i}",
+            warehouse_id="w1" if i % 3 else "w2",
+            quantity=1,
+            tenant_id="tenant-a" if i % 5 else "tenant-b",
+        )
+
+
+def _expected_ids(fake_db, tenant_id, warehouse_id=None, q=None):
+    rows = [r for r in fake_db.items if r["tenant_id"] == tenant_id]
+    if warehouse_id is not None:
+        rows = [r for r in rows if r["warehouse_id"] == warehouse_id]
+    if q is not None:
+        rows = [r for r in rows if q.lower() in r["name"].lower()]
+    return sorted(r["id"] for r in rows)
+
+
+def test_search_items_next_cursor_is_last_returned_id(client, fake_db):
+    for i in range(5):
+        fake_db.add_item(sku=f"SKU{i}", name=f"item {i}", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    body = client.get("/items", params={"limit": 2}, headers=TENANT_A).json()
+    assert body["next_cursor"] == body["items"][-1]["id"]
+
+    body2 = client.get("/items", params={"limit": 2, "cursor": body["next_cursor"]}, headers=TENANT_A).json()
+    assert body2["items"][0]["id"] > body["items"][-1]["id"]
+
+
+def test_search_items_walks_every_item_exactly_once(client, fake_db):
+    _seed_mixed(fake_db)
+    expected = _expected_ids(fake_db, "tenant-a")
+    for limit in range(1, len(expected) + 2):
+        ids, _ = _walk_pages(client, TENANT_A, limit=limit)
+        assert ids == expected, f"limit={limit}"
+
+
+def test_search_items_exact_multiple_of_limit_has_no_empty_trailing_page(client, fake_db):
+    for i in range(6):
+        fake_db.add_item(sku=f"SKU{i}", name=f"item {i}", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    ids, pages = _walk_pages(client, TENANT_A, limit=3)
+    assert len(ids) == 6
+    assert pages == 2
+
+
+def test_search_items_pagination_respects_filters(client, fake_db):
+    _seed_mixed(fake_db)
+    cases = [
+        {"warehouse_id": "w1"},
+        {"warehouse_id": "w2"},
+        {"q": "item"},
+        {"q": "gadget"},
+        {"warehouse_id": "w1", "q": "item"},
+    ]
+    for filters in cases:
+        expected = _expected_ids(fake_db, "tenant-a", filters.get("warehouse_id"), filters.get("q"))
+        assert expected, filters
+        for limit in (1, 2, 3, 5):
+            ids, _ = _walk_pages(client, TENANT_A, limit=limit, **filters)
+            assert ids == expected, f"filters={filters} limit={limit}"
+
+
+def test_search_items_pagination_scoped_to_tenant(client, fake_db):
+    _seed_mixed(fake_db)
+    for headers, tenant in ((TENANT_A, "tenant-a"), (TENANT_B, "tenant-b")):
+        expected = _expected_ids(fake_db, tenant)
+        ids, _ = _walk_pages(client, headers, limit=2)
+        assert ids == expected
+
+
+def test_search_items_rejects_non_positive_limit(client, fake_db):
+    fake_db.add_item(sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    for limit in (0, -1):
+        resp = client.get("/items", params={"limit": limit}, headers=TENANT_A)
+        assert resp.status_code == 422
