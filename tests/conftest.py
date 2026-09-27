@@ -4,6 +4,7 @@ Everything runs in-process against a FakeDB: no Postgres, no network, no
 real secrets. Environment variables the app reads at import time are set
 before ``app.main`` is imported for the first time.
 """
+
 import re
 import os
 from contextlib import contextmanager
@@ -135,7 +136,7 @@ class FakeDB:
         limit_plus1 = params.pop(-1)
         warehouse_id = params.pop(0) if "warehouse_id = %s" in sql else None
         name_like = params.pop(0) if "name ILIKE %s" in sql else None
-        cursor = params.pop(0) if "id >= %s" in sql else None
+        cursor = params.pop(0) if "id > %s" in sql else None
         rows = [r for r in self.items if r["tenant_id"] == tenant_id]
         if warehouse_id is not None:
             rows = [r for r in rows if r["warehouse_id"] == warehouse_id]
@@ -143,7 +144,7 @@ class FakeDB:
             needle = name_like.strip("%").lower()
             rows = [r for r in rows if needle in r["name"].lower()]
         if cursor is not None:
-            rows = [r for r in rows if r["id"] >= cursor]
+            rows = [r for r in rows if r["id"] > cursor]
         rows.sort(key=lambda r: r["id"])
         return [dict(r) for r in rows[:limit_plus1]]
 
@@ -153,7 +154,11 @@ class FakeDB:
         if sql.startswith("SELECT * FROM items WHERE sku = %s AND tenant_id = %s"):
             sku, tenant_id = params
             return next(
-                (dict(r) for r in self.items if r["sku"] == sku and r["tenant_id"] == tenant_id),
+                (
+                    dict(r)
+                    for r in self.items
+                    if r["sku"] == sku and r["tenant_id"] == tenant_id
+                ),
                 None,
             )
         if sql.startswith("SELECT quantity FROM items"):
@@ -200,9 +205,11 @@ class FakeDB:
         if sql.startswith("UPDATE items SET quantity = quantity - %s"):
             delta, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", r["quantity"] - delta),
             )
 
@@ -219,7 +226,10 @@ class FakeDB:
             )
             return 1
 
-        if sql.startswith("UPDATE items SET") and "WHERE id = %s AND tenant_id = %s" in sql:
+        if (
+            sql.startswith("UPDATE items SET")
+            and "WHERE id = %s AND tenant_id = %s" in sql
+        ):
             *values, item_id, tenant_id = params
             cols = re.findall(r"(\w+) = %s", sql.split("WHERE")[0])
             return self._update_items(
@@ -230,27 +240,36 @@ class FakeDB:
         if sql.startswith("UPDATE items SET quantity = %s"):
             quantity, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", quantity),
             )
 
         if sql.startswith("UPDATE items SET price = %s"):
             price, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("price", price),
             )
 
-        if sql.startswith("UPDATE items SET quantity = quantity + %s") and "warehouse_id = %s" in sql:
+        if (
+            sql.startswith("UPDATE items SET quantity = quantity + %s")
+            and "warehouse_id = %s" in sql
+        ):
             delta, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", r["quantity"] + delta),
             )
 
@@ -282,7 +301,9 @@ class FakeDB:
             item_id, tenant_id = params
             before = len(self.items)
             self.items = [
-                r for r in self.items if not (r["id"] == item_id and r["tenant_id"] == tenant_id)
+                r
+                for r in self.items
+                if not (r["id"] == item_id and r["tenant_id"] == tenant_id)
             ]
             return before - len(self.items)
 

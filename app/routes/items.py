@@ -1,5 +1,6 @@
 """Inventory item lookup, search, and stock reservation."""
-from fastapi import APIRouter, Header, HTTPException
+
+from fastapi import APIRouter, Header, HTTPException, Query
 
 from app import cache
 from app.db import execute, fetch_all, fetch_one
@@ -30,11 +31,16 @@ def get_item(sku: str, x_tenant_id: str = Header()):
 def search_items(
     warehouse_id: str = "",
     q: str = "",
-    limit: int = 50,
+    limit: int = Query(50, ge=1),
     cursor: str = "",
     x_tenant_id: str = Header(),
 ):
-    """Search items, newest id last, with keyset pagination by id."""
+    """Search items, newest id last, with keyset pagination by id.
+
+    ``next_cursor`` is the id of the last item on the returned page; the next
+    page resumes strictly after it, so following cursors yields every matching
+    item exactly once. ``limit`` must be at least 1 so each page makes progress.
+    """
     tenant_id = _tenant(x_tenant_id)
     clauses = ["tenant_id = %s"]
     params: list = [tenant_id]
@@ -46,7 +52,7 @@ def search_items(
         params.append(f"%{q}%")
     if cursor:
         # Continue after the last id we returned on the previous page.
-        clauses.append("id >= %s")
+        clauses.append("id > %s")
         params.append(cursor)
     where = " AND ".join(clauses)
     params.append(limit + 1)
@@ -55,9 +61,10 @@ def search_items(
         tuple(params),
     )
     next_cursor = None
+    # We fetched one extra row only to learn whether another page exists.
     if len(rows) > limit:
-        next_cursor = rows[limit]["id"]
         rows = rows[:limit]
+        next_cursor = rows[-1]["id"]
     return Page(items=rows, next_cursor=next_cursor)
 
 
