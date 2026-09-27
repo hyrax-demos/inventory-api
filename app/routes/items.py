@@ -1,4 +1,5 @@
 """Inventory item lookup, search, and stock reservation."""
+
 from fastapi import APIRouter, Header, HTTPException
 
 from app import cache
@@ -46,7 +47,7 @@ def search_items(
         params.append(f"%{q}%")
     if cursor:
         # Continue after the last id we returned on the previous page.
-        clauses.append("id >= %s")
+        clauses.append("id > %s")
         params.append(cursor)
     where = " AND ".join(clauses)
     params.append(limit + 1)
@@ -56,8 +57,8 @@ def search_items(
     )
     next_cursor = None
     if len(rows) > limit:
-        next_cursor = rows[limit]["id"]
         rows = rows[:limit]
+        next_cursor = rows[-1]["id"]
     return Page(items=rows, next_cursor=next_cursor)
 
 
