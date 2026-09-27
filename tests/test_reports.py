@@ -183,6 +183,42 @@ def test_low_stock_csv_scoped_to_tenant(client, fake_db):
     assert [r["sku"] for r in _csv_rows(resp_b)] == ["B1", "B2"]
 
 
+def test_low_stock_csv_warehouse_filter(client, fake_db):
+    fake_db.add_item(
+        sku="W1A", name="w1a", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
+    )
+    fake_db.add_item(
+        sku="W2A", name="w2a", warehouse_id="w2", quantity=2, tenant_id="tenant-a"
+    )
+    fake_db.add_item(
+        sku="W1HI", name="w1hi", warehouse_id="w1", quantity=50, tenant_id="tenant-a"
+    )
+    fake_db.add_item(
+        sku="W1B", name="w1b", warehouse_id="w1", quantity=1, tenant_id="tenant-b"
+    )
+    resp = client.get(
+        "/reports/low-stock.csv", params={"warehouse_id": "w1"}, headers=TENANT_A
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/csv")
+    rows = _csv_rows(resp)
+    # Only w1, only tenant-a, and the threshold still applies.
+    assert [r["sku"] for r in rows] == ["W1A"]
+    assert all(r["warehouse_id"] == "w1" for r in rows)
+
+    # Unknown warehouse: just the header row.
+    resp = client.get(
+        "/reports/low-stock.csv", params={"warehouse_id": "nope"}, headers=TENANT_A
+    )
+    assert resp.status_code == 200
+    assert resp.text.splitlines() == ["sku,name,warehouse_id,quantity"]
+
+    # No filter (or an empty one): every warehouse for the tenant.
+    for params in ({}, {"warehouse_id": ""}):
+        resp = client.get("/reports/low-stock.csv", params=params, headers=TENANT_A)
+        assert [r["sku"] for r in _csv_rows(resp)] == ["W1A", "W2A"]
+
+
 def test_low_stock_csv_missing_tenant_header_rejected_like_json(client, fake_db):
     json_resp = client.get("/reports/low-stock")
     csv_resp = client.get("/reports/low-stock.csv")

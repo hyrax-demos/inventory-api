@@ -47,11 +47,15 @@ Admin and sync endpoints require the `X-Admin-Token` header.
 
 `GET /reports/low-stock.csv` returns the same rows as `GET /reports/low-stock`,
 as CSV. Both endpoints use the same query, so tenant scoping, threshold filtering
-and ordering are identical.
+and ordering are identical. The CSV endpoint additionally accepts an optional
+`warehouse_id` filter.
 
 - **Tenant header:** `X-Tenant-Id` (required). Rows come only from this tenant.
 - **Query parameter:** `threshold` (integer, default `10`). An item is included
   when `quantity <= threshold`. Rows are sorted by `quantity`, lowest first.
+- **Query parameter:** `warehouse_id` (string, optional, CSV endpoint only).
+  When set, only items in that warehouse are returned; an unknown warehouse
+  yields just the header row. Omitted or empty means all warehouses.
 - **Response:** `200` with a `text/csv` Content-Type, UTF-8 encoded. The body
   starts with the header row `sku,name,warehouse_id,quantity`, followed by one
   row per low-stock item in that column order. If no items match, the body is
@@ -78,4 +82,11 @@ curl -s -H "X-Tenant-Id: acme" \
 sku,name,warehouse_id,quantity
 SKU-1042,"Bolt, ""M6"" x 20mm",wh-east,2
 SKU-0007,Washer,wh-west,5
+```
+
+To limit the export to one warehouse, add `warehouse_id`:
+
+```bash
+curl -s -H "X-Tenant-Id: acme" \
+  "http://localhost:8000/reports/low-stock.csv?threshold=5&warehouse_id=wh-east"
 ```

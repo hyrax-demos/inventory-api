@@ -14,12 +14,23 @@ router = APIRouter()
 LOW_STOCK_CSV_COLUMNS = ("sku", "name", "warehouse_id", "quantity")
 
 
-def low_stock_items(tenant_id: str, threshold: int) -> list[dict]:
-    """Items at or below ``threshold`` for ``tenant_id``, lowest quantity first."""
+def low_stock_items(
+    tenant_id: str, threshold: int, warehouse_id: str = ""
+) -> list[dict]:
+    """Items at or below ``threshold`` for ``tenant_id``, lowest quantity first.
+
+    When ``warehouse_id`` is non-empty, only that warehouse's items are returned.
+    """
+    clauses = ["tenant_id = %s", "quantity <= %s"]
+    params: list = [tenant_id, threshold]
+    if warehouse_id:
+        clauses.append("warehouse_id = %s")
+        params.append(warehouse_id)
+    where = " AND ".join(clauses)
     return fetch_all(
         "SELECT sku, name, warehouse_id, quantity FROM items "
-        "WHERE tenant_id = %s AND quantity <= %s ORDER BY quantity ASC",
-        (tenant_id, threshold),
+        f"WHERE {where} ORDER BY quantity ASC",
+        tuple(params),
     )
 
 
@@ -41,9 +52,14 @@ def low_stock_report(threshold: int = 10, x_tenant_id: str = Header()):
 
 
 @router.get("/reports/low-stock.csv")
-def low_stock_report_csv(threshold: int = 10, x_tenant_id: str = Header()):
-    """CSV export of the low-stock report (same filtering as the JSON endpoint)."""
-    rows = low_stock_items(x_tenant_id, threshold)
+def low_stock_report_csv(
+    threshold: int = 10, warehouse_id: str = "", x_tenant_id: str = Header()
+):
+    """CSV export of the low-stock report (same filtering as the JSON endpoint).
+
+    Optionally narrowed to a single warehouse with ``?warehouse_id=``.
+    """
+    rows = low_stock_items(x_tenant_id, threshold, warehouse_id)
     return Response(content=low_stock_csv(rows), media_type="text/csv; charset=utf-8")
 
 
