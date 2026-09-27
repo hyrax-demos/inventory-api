@@ -1,4 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
+
+from app.routes import reports as reports_routes
 
 TENANT_A = {"X-Tenant-Id": "tenant-a"}
 
@@ -40,6 +43,73 @@ def test_todays_movements_scoped_to_tenant(client, fake_db):
     assert resp.status_code == 200
     body = resp.json()
     assert body["movements"] == []
+
+
+def test_todays_movements_uses_utc_midnight_regardless_of_local_time():
+    """The query boundary must be UTC midnight, not local-wall-clock midnight.
+
+    Simulate a server whose local clock reads late evening UTC-behind time
+    (e.g. 23:30 local, which is already the next UTC day) and assert the
+    cutoff passed to the query is timezone-aware and pinned to the current
+    *UTC* calendar date at 00:00:00, not derived from naive local time.
+    """
+    fixed_now_utc = datetime(2024, 3, 15, 2, 0, 0, tzinfo=timezone.utc)
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                # naive local wall-clock time is "behind" UTC by several
+                # hours here, on the *previous* calendar day.
+                return datetime(2024, 3, 14, 21, 0, 0)
+            return fixed_now_utc.astimezone(tz)
+
+    with patch.object(reports_routes, "datetime", _FixedDatetime):
+        captured = {}
+
+        def fake_fetch_all(sql, params):
+            captured["params"] = params
+            return []
+
+        with patch.object(reports_routes, "fetch_all", fake_fetch_all):
+            result = reports_routes.todays_movements(x_tenant_id="tenant-a")
+
+    _, start_of_day = captured["params"]
+    assert start_of_day.tzinfo is not None
+    assert start_of_day.astimezone(timezone.utc) == datetime(
+        2024, 3, 15, 0, 0, 0, tzinfo=timezone.utc
+    )
+    assert result["date"] == "2024-03-15"
+
+
+def test_todays_movements_excludes_entry_from_previous_utc_day(client, fake_db):
+    """A movement created just before today's UTC midnight must be excluded,
+    even though it may still be "today" in the server's local timezone."""
+    now_utc = datetime.now(timezone.utc)
+    start_of_utc_day = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    just_before_utc_midnight = start_of_utc_day - timedelta(seconds=1)
+
+    fake_db.add_movement(
+        sku="OLD",
+        warehouse_id="w1",
+        delta=-1,
+        created_at=just_before_utc_midnight,
+        tenant_id="tenant-a",
+    )
+    fake_db.add_movement(
+        sku="NEW",
+        warehouse_id="w1",
+        delta=-1,
+        created_at=now_utc,
+        tenant_id="tenant-a",
+    )
+
+    resp = client.get("/reports/today", headers=TENANT_A)
+    assert resp.status_code == 200
+    body = resp.json()
+    skus = [m["sku"] for m in body["movements"]]
+    assert "NEW" in skus
+    assert "OLD" not in skus
 
 
 def test_reserved_value_happy_path(client, fake_db):
