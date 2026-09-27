@@ -17,6 +17,19 @@ def test_low_stock_report_happy_path(client, fake_db):
     assert [i["sku"] for i in body["items"]] == ["A"]
 
 
+def test_low_stock_report_empty_tenant_header_is_rejected(client, fake_db):
+    fake_db.add_item(
+        sku="A", name="a", warehouse_id="w1", quantity=2, tenant_id="tenant-a"
+    )
+    resp = client.get(
+        "/reports/low-stock",
+        params={"threshold": 10},
+        headers={"X-Tenant-Id": ""},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "missing tenant"
+
+
 def test_low_stock_report_scoped_to_tenant(client, fake_db):
     fake_db.add_item(
         sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
