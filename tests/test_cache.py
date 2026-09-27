@@ -1,4 +1,5 @@
 """Unit tests for app/cache.py's stock-key scoping and prefix invalidation."""
+
 from app import cache as cache_module
 
 

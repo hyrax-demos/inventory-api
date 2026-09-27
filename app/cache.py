@@ -4,6 +4,7 @@ Stock and price reads dominate traffic and the underlying rows change slowly,
 so we memoize them for a few seconds to take load off Postgres. Entries expire
 on read once they pass their TTL.
 """
+
 import time
 
 # key -> (expires_at_monotonic, value)
