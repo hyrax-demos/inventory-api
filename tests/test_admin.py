@@ -36,7 +36,9 @@ def test_delete_item_not_found(client, fake_db):
 
 
 def test_update_item(client, fake_db):
-    row = fake_db.add_item(sku="A", name="old", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    row = fake_db.add_item(
+        sku="A", name="old", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
+    )
     resp = client.post(
         f"/admin/items/{row['id']}/update",
         json={"name": "new"},
@@ -64,3 +66,27 @@ def test_bulk_adjust(client, fake_db):
     assert resp.json()["adjusted"] == 2
     by_sku = {r["sku"]: r["quantity"] for r in fake_db.items}
     assert by_sku == {"A": 6, "B": 0}
+
+
+def test_bulk_adjust_invalidates_the_stock_cache_get_actually_reads(client, fake_db):
+    """bulk_adjust must invalidate the same tenant+warehouse+sku scoped key
+    GET /items/{sku}/stock reads, not a SKU-only key -- otherwise the GET
+    handler would keep serving the pre-adjustment quantity from cache."""
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+
+    warmed = client.get(
+        "/items/A/stock", params={"warehouse_id": "w1"}, headers=TENANT_A
+    )
+    assert warmed.json()["quantity"] == 1
+
+    resp = client.post(
+        "/admin/items/bulk-adjust",
+        json=[{"sku": "A", "delta": 5}],
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+
+    after = client.get(
+        "/items/A/stock", params={"warehouse_id": "w1"}, headers=TENANT_A
+    )
+    assert after.json()["quantity"] == 6

@@ -3,11 +3,12 @@
 All endpoints require the shared admin token (``require_admin``) and are scoped
 to the caller's tenant.
 """
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache
 from app.auth import require_admin
-from app.db import execute
+from app.db import execute, fetch_all
 from app.models import ItemUpdate, StockAdjustment
 
 router = APIRouter(dependencies=[Depends(require_admin)])
@@ -38,9 +39,7 @@ def delete_item(item_id: str, x_tenant_id: str = Header()):
 def update_item(item_id: str, patch: ItemUpdate, x_tenant_id: str = Header()):
     """Apply a partial update to an item using only whitelisted columns."""
     fields = {
-        k: v
-        for k, v in patch.model_dump(exclude_unset=True).items()
-        if k in _PATCHABLE
+        k: v for k, v in patch.model_dump(exclude_unset=True).items() if k in _PATCHABLE
     }
     if not fields:
         raise HTTPException(status_code=400, detail="no patchable fields")
@@ -64,5 +63,19 @@ def bulk_adjust(adjustments: list[StockAdjustment], x_tenant_id: str = Header())
             "WHERE sku = %s AND tenant_id = %s",
             (adj.delta, adj.sku, x_tenant_id),
         )
-        cache.invalidate(cache.stock_key(adj.sku))
+        # The update above isn't scoped to a single warehouse, so look up
+        # every warehouse this SKU actually landed in for this tenant and
+        # invalidate each one's stock cache entry individually -- the key
+        # GET /items/{sku}/stock reads is tenant+warehouse+sku scoped, so
+        # invalidating by SKU alone (the old stock_key helper) would leave
+        # other tenants'/warehouses' entries for the same SKU untouched
+        # and this tenant's entries stale.
+        rows = fetch_all(
+            "SELECT * FROM items WHERE sku = %s AND tenant_id = %s",
+            (adj.sku, x_tenant_id),
+        )
+        for row in rows:
+            cache.invalidate(
+                cache.stock_cache_key(x_tenant_id, row["warehouse_id"], sku=adj.sku)
+            )
     return {"adjusted": len(adjustments)}
