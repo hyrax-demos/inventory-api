@@ -1,4 +1,7 @@
 """Domain models for the inventory API."""
+
+from datetime import datetime
+
 from pydantic import BaseModel
 
 
@@ -9,6 +12,8 @@ class Item(BaseModel):
     quantity: int
     warehouse_id: str
     price: float = 0.0
+    # NULL/None = live; set = soft-deleted at that time.
+    deleted_at: datetime | None = None
 
 
 class StockAdjustment(BaseModel):
