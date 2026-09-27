@@ -132,3 +132,41 @@ def test_import_snapshot_rejects_malformed_entry(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 400
+
+
+def test_low_stock_report_rejects_empty_tenant_header(client, fake_db):
+    fake_db.add_item(sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="")
+    resp = client.get("/reports/low-stock", headers={"X-Tenant-Id": ""})
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": "missing tenant"}
+
+
+def test_low_stock_report_empty_tenant_matches_items_routes(client, fake_db):
+    empty = {"X-Tenant-Id": ""}
+    items_resp = client.get("/items/WIDGET", headers=empty)
+    reports_resp = client.get("/reports/low-stock", headers=empty)
+    assert reports_resp.status_code == items_resp.status_code == 400
+    assert reports_resp.json() == items_resp.json()
+
+
+def test_low_stock_report_empty_tenant_does_not_query_db(client, fake_db, monkeypatch):
+    from app.routes import reports as reports_routes
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("database must not be queried for an empty tenant")
+
+    monkeypatch.setattr(reports_routes, "fetch_all", _boom)
+    resp = client.get("/reports/low-stock", headers={"X-Tenant-Id": ""})
+    assert resp.status_code == 400
+
+
+def test_low_stock_report_valid_tenant_still_returns_data(client, fake_db):
+    fake_db.add_item(
+        sku="A", name="a", warehouse_id="w1", quantity=3, tenant_id="tenant-a"
+    )
+    resp = client.get("/reports/low-stock", params={"threshold": 5}, headers=TENANT_A)
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "threshold": 5,
+        "items": [{"sku": "A", "name": "a", "warehouse_id": "w1", "quantity": 3}],
+    }

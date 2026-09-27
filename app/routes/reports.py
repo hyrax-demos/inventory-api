@@ -6,6 +6,7 @@ from datetime import datetime
 from fastapi import APIRouter, Header, HTTPException
 
 from app.db import execute, fetch_all
+from app.routes.items import _tenant
 
 router = APIRouter()
 
@@ -13,10 +14,11 @@ router = APIRouter()
 @router.get("/reports/low-stock")
 def low_stock_report(threshold: int = 10, x_tenant_id: str = Header()):
     """Items at or below the reorder threshold, scoped to the tenant."""
+    tenant_id = _tenant(x_tenant_id)
     rows = fetch_all(
         "SELECT sku, name, warehouse_id, quantity FROM items "
         "WHERE tenant_id = %s AND quantity <= %s ORDER BY quantity ASC",
-        (x_tenant_id, threshold),
+        (tenant_id, threshold),
     )
     return {"threshold": threshold, "items": rows}
 
