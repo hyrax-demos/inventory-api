@@ -52,6 +52,7 @@ def reserved_value(x_tenant_id: str = Header()):
         "FROM reservations r "
         "JOIN items i "
         "  ON i.sku = r.sku AND i.warehouse_id = r.warehouse_id "
+        " AND i.tenant_id = r.tenant_id "
         f" AND {live_items('i')} "
         "WHERE r.tenant_id = %s "
         "GROUP BY r.sku, r.warehouse_id "

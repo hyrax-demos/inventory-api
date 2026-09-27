@@ -72,7 +72,7 @@ def test_soft_delete_invalidates_cached_stock(client, fake_db):
         ).status_code
         == 200
     )
-    assert cache.get(cache.stock_key("WIDGET")) is not None
+    assert cache.get(cache.stock_key("tenant-a", "WIDGET")) is not None
 
     queries.soft_delete_item("tenant-a", "WIDGET")
 

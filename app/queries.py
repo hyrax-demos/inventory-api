@@ -36,7 +36,7 @@ def soft_delete_item(tenant_id: str, sku: str) -> bool:
     if affected:
         # The stock cache is read before the DB; drop it so the deleted item
         # stops being served from cache immediately.
-        cache.invalidate(cache.stock_key(sku))
+        cache.invalidate(cache.stock_key(tenant_id, sku))
     return affected > 0
 
 
@@ -52,5 +52,5 @@ def restore_item(tenant_id: str, sku: str) -> bool:
         (tenant_id, sku),
     )
     if affected:
-        cache.invalidate(cache.stock_key(sku))
+        cache.invalidate(cache.stock_key(tenant_id, sku))
     return affected > 0
