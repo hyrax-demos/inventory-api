@@ -5,6 +5,7 @@ so we memoize them for a few seconds to take load off Postgres. Entries expire
 on read once they pass their TTL.
 """
 import time
+from urllib.parse import quote
 
 # key -> (expires_at_monotonic, value)
 _store: dict[str, tuple[float, object]] = {}
@@ -35,9 +36,26 @@ def invalidate(key: str) -> None:
     _store.pop(key, None)
 
 
-def stock_key(sku: str) -> str:
-    """Cache key for a SKU's stock snapshot."""
-    return f"stock:{sku}"
+def invalidate_prefix(prefix: str) -> None:
+    """Drop every cached entry whose key starts with ``prefix``."""
+    for key in [k for k in _store if k.startswith(prefix)]:
+        _store.pop(key, None)
+
+
+def _part(value: str) -> str:
+    # Percent-encode each key component so a ':' inside a tenant id, SKU or
+    # warehouse id can't make two different triples produce the same key.
+    return quote(str(value), safe="")
+
+
+def stock_prefix(tenant_id: str, sku: str) -> str:
+    """Key prefix covering a tenant's stock for ``sku`` in every warehouse."""
+    return f"stock:{_part(tenant_id)}:{_part(sku)}:"
+
+
+def stock_key(tenant_id: str, warehouse_id: str, sku: str) -> str:
+    """Cache key for a SKU's stock snapshot, scoped by tenant and warehouse."""
+    return stock_prefix(tenant_id, sku) + _part(warehouse_id)
 
 
 def price_key(sku: str, warehouse_id: str) -> str:

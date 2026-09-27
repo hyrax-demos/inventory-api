@@ -41,3 +41,28 @@ def test_release_reservation_happy_path(client, fake_db):
 def test_release_reservation_not_found(client, fake_db):
     resp = client.post("/reservations/does-not-exist/release", headers={"X-Tenant-Id": "tenant-a"})
     assert resp.status_code == 404
+
+
+def _stock(client, sku, warehouse_id, tenant_id):
+    resp = client.get(
+        f"/items/{sku}/stock",
+        params={"warehouse_id": warehouse_id},
+        headers={"X-Tenant-Id": tenant_id},
+    )
+    assert resp.status_code == 200
+    return resp.json()["quantity"]
+
+
+def test_release_reservation_is_reflected_on_next_read(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=5, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=50, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=7, tenant_id="tenant-b")
+    fake_db.add_reservation(order_id="order-1", tenant_id="tenant-a", sku="WIDGET", warehouse_id="w2", quantity=3)
+    assert _stock(client, "WIDGET", "w2", "tenant-a") == 5  # warm cache
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 50
+    assert _stock(client, "WIDGET", "w2", "tenant-b") == 7
+    resp = client.post("/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"})
+    assert resp.status_code == 200
+    assert _stock(client, "WIDGET", "w2", "tenant-a") == 8
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 50
+    assert _stock(client, "WIDGET", "w2", "tenant-b") == 7
