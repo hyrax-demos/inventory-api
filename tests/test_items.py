@@ -126,3 +126,52 @@ def test_reserve_stock_missing_item(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 404
+
+
+def test_get_stock_cache_is_scoped_by_warehouse(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=99, tenant_id="tenant-a")
+    r1 = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    r2 = client.get("/items/WIDGET/stock", params={"warehouse_id": "w2"}, headers=TENANT_A)
+    assert r1.json()["quantity"] == 10
+    assert r2.json()["quantity"] == 99
+    # repeat reads (served from cache) stay per-warehouse
+    r1b = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    assert r1b.json()["quantity"] == 10
+
+
+def test_get_stock_cache_is_scoped_by_tenant(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    ra = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    assert ra.json()["quantity"] == 10
+    # tenant-b has no such item; it must not see tenant-a's cached value
+    rb = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_B)
+    assert rb.status_code == 404
+
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=3, tenant_id="tenant-b")
+    rb2 = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_B)
+    assert rb2.json()["quantity"] == 3
+
+
+def test_stock_key_components_cannot_collide():
+    from app import cache
+
+    assert cache.stock_key("a:b", "c", "d") != cache.stock_key("a", "b:c", "d")
+
+
+def test_reserve_stock_is_reflected_on_next_stock_read(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=20, tenant_id="tenant-a")
+    # warm the cache for both warehouses
+    client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    client.get("/items/WIDGET/stock", params={"warehouse_id": "w2"}, headers=TENANT_A)
+    resp = client.post(
+        "/items/reserve",
+        json={"sku": "WIDGET", "warehouse_id": "w1", "quantity": 4, "order_id": "order-1"},
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+    r1 = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    r2 = client.get("/items/WIDGET/stock", params={"warehouse_id": "w2"}, headers=TENANT_A)
+    assert r1.json()["quantity"] == 6
+    assert r2.json()["quantity"] == 20
