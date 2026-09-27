@@ -1,5 +1,7 @@
 from datetime import datetime
 
+from fastapi.testclient import TestClient
+
 TENANT_A = {"X-Tenant-Id": "tenant-a"}
 
 
@@ -174,3 +176,172 @@ def test_import_snapshot_rejects_malformed_entry(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 400
+
+
+class _StagedConnection:
+    """A fake psycopg2 connection with real commit/rollback semantics.
+
+    Writes are staged and only applied to the FakeDB on ``commit()``;
+    ``rollback()`` discards them. ``fail_on`` makes the Nth ``execute`` call
+    (1-based) raise, simulating a write failure mid-import.
+    """
+
+    def __init__(self, fake_db, fail_on=None):
+        self._fake_db = fake_db
+        self._fail_on = fail_on
+        self._calls = 0
+        self._pending: list = []
+        self.committed = False
+        self.rolled_back = False
+        self.closed = False
+
+    def cursor(self, cursor_factory=None):
+        return self
+
+    def execute(self, sql, params=()):
+        self._calls += 1
+        if self._fail_on is not None and self._calls == self._fail_on:
+            raise RuntimeError("simulated write failure")
+        self._pending.append((sql, params))
+
+    @property
+    def rowcount(self):
+        return 1
+
+    def commit(self):
+        for sql, params in self._pending:
+            self._fake_db.execute(sql, params)
+        self._pending = []
+        self.committed = True
+
+    def rollback(self):
+        self._pending = []
+        self.rolled_back = True
+
+    def close(self):
+        self.closed = True
+
+
+def _use_staged_connection(monkeypatch, fake_db, fail_on=None):
+    """Route import_snapshot through the real ``app.db.transaction`` helper,
+    backed by a staged fake connection instead of Postgres."""
+    from app import db as db_module
+    from app.routes import reports as reports_routes
+
+    conn = _StagedConnection(fake_db, fail_on=fail_on)
+    connections = []
+
+    def _get_connection():
+        connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(db_module, "get_connection", _get_connection)
+    monkeypatch.setattr(reports_routes, "transaction", db_module.transaction)
+    return conn, connections
+
+
+def _seed_three(fake_db):
+    for sku in ("A", "B", "C"):
+        fake_db.add_item(sku=sku, warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+
+
+def _quantities(fake_db):
+    return {r["sku"]: r["quantity"] for r in fake_db.items}
+
+
+def test_import_snapshot_malformed_last_entry_writes_nothing(
+    client, fake_db, monkeypatch
+):
+    _seed_three(fake_db)
+    _, connections = _use_staged_connection(monkeypatch, fake_db)
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1"},  # missing quantity
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": "malformed snapshot entry"}
+    assert _quantities(fake_db) == {"A": 1, "B": 1, "C": 1}
+    # Validation happens up front: no connection is even opened.
+    assert connections == []
+
+
+def test_import_snapshot_rejects_wrongly_typed_entry_and_writes_nothing(
+    client, fake_db, monkeypatch
+):
+    _seed_three(fake_db)
+    _, connections = _use_staged_connection(monkeypatch, fake_db)
+    for bad in (
+        {"sku": "C", "warehouse_id": "w1", "quantity": "lots"},
+        {"sku": 7, "warehouse_id": "w1", "quantity": 3},
+        {"sku": "C", "warehouse_id": None, "quantity": 3},
+        "not-an-object",
+    ):
+        resp = client.post(
+            "/reports/import",
+            json={"items": [{"sku": "A", "warehouse_id": "w1", "quantity": 10}, bad]},
+            headers=TENANT_A,
+        )
+        assert resp.status_code == 400, bad
+    assert _quantities(fake_db) == {"A": 1, "B": 1, "C": 1}
+    assert connections == []
+
+
+def test_import_snapshot_write_failure_rolls_back_all_entries(
+    client, fake_db, monkeypatch
+):
+    _seed_three(fake_db)
+    conn, connections = _use_staged_connection(monkeypatch, fake_db, fail_on=3)
+    failing_client = TestClient(client.app, raise_server_exceptions=False)
+    resp = failing_client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": 30},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 500
+    assert _quantities(fake_db) == {"A": 1, "B": 1, "C": 1}
+    assert conn.rolled_back and not conn.committed and conn.closed
+    # All writes shared the one connection.
+    assert len(connections) == 1
+
+
+def test_import_snapshot_applies_every_entry_in_one_transaction(
+    client, fake_db, monkeypatch
+):
+    _seed_three(fake_db)
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=1, tenant_id="tenant-b")
+    conn, connections = _use_staged_connection(monkeypatch, fake_db)
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": 30},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"items": 3, "snapshot": '{"received": 3}'}
+    tenant_a = {
+        r["sku"]: r["quantity"] for r in fake_db.items if r["tenant_id"] == "tenant-a"
+    }
+    assert tenant_a == {"A": 10, "B": 20, "C": 30}
+    # The other tenant's row at the same SKU/warehouse is untouched.
+    tenant_b = [r for r in fake_db.items if r["tenant_id"] == "tenant-b"]
+    assert tenant_b[0]["quantity"] == 1
+    assert conn.committed and not conn.rolled_back and conn.closed
+    assert len(connections) == 1

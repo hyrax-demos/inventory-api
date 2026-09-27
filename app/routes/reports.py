@@ -5,7 +5,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Header, HTTPException
 
-from app.db import execute, fetch_all
+from app.db import fetch_all, transaction
 from app.routes.items import _tenant
 
 router = APIRouter()
@@ -66,22 +66,40 @@ async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
     """Bulk-import a stock snapshot.
 
     Body: {"items": [{"sku": "ABC", "warehouse_id": "w1", "quantity": 5}, ...]}
+
+    The import is all-or-nothing: every entry is validated before anything is
+    written, and all updates are applied inside a single transaction that is
+    rolled back if any write fails.
     """
     items = payload.get("items")
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="items must be a list")
-    count = 0
-    for entry in items:
-        try:
-            sku = entry["sku"]
-            warehouse_id = entry["warehouse_id"]
-            quantity = int(entry["quantity"])
-        except (KeyError, TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="malformed snapshot entry")
-        execute(
-            "UPDATE items SET quantity = %s "
-            "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-            (quantity, sku, warehouse_id, x_tenant_id),
-        )
-        count += 1
+
+    updates = [_parse_snapshot_entry(entry) for entry in items]
+
+    with transaction() as conn:
+        cur = conn.cursor()
+        for quantity, sku, warehouse_id in updates:
+            cur.execute(
+                "UPDATE items SET quantity = %s "
+                "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
+                (quantity, sku, warehouse_id, x_tenant_id),
+            )
+    count = len(updates)
     return {"items": count, "snapshot": json.dumps({"received": count})}
+
+
+def _parse_snapshot_entry(entry) -> tuple[int, str, str]:
+    """Validate one snapshot entry; return ``(quantity, sku, warehouse_id)``.
+
+    Raises the route's 400 for a malformed entry, before any write happens.
+    """
+    try:
+        sku = entry["sku"]
+        warehouse_id = entry["warehouse_id"]
+        quantity = int(entry["quantity"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="malformed snapshot entry")
+    if not isinstance(sku, str) or not isinstance(warehouse_id, str):
+        raise HTTPException(status_code=400, detail="malformed snapshot entry")
+    return quantity, sku, warehouse_id
