@@ -166,3 +166,64 @@ def test_release_reservation_rolls_back_restore_when_delete_fails(fake_db, monke
         for s in conn.statements
     )
     assert conn.rolled_back and not conn.committed
+
+
+def test_release_reservation_twice_does_not_restore_stock_twice(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    headers = {"X-Tenant-Id": "tenant-a"}
+
+    first = client.post("/reservations/order-1/release", headers=headers)
+    assert first.status_code == 200
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
+
+    second = client.post("/reservations/order-1/release", headers=headers)
+    assert second.status_code == 404
+    assert fake_db.items[0]["quantity"] == 8
+
+
+class _ConcurrentlyReleasedConnection(_RecordingConnection):
+    """A connection whose DELETE finds the row already gone (lost race)."""
+
+    rowcount = 0
+
+    def __init__(self):
+        super().__init__(fail_on="\0never")
+
+
+def test_release_reservation_rolls_back_restore_when_already_released(
+    fake_db, monkeypatch
+):
+    from fastapi.testclient import TestClient
+
+    from app import db
+    from app.main import app
+    from app.routes import sync as sync_routes
+
+    # The lookup still sees the reservation, but by the time our transaction
+    # deletes it a concurrent release has already removed it.
+    conn = _ConcurrentlyReleasedConnection()
+    monkeypatch.setattr(db, "get_connection", lambda: conn)
+    monkeypatch.setattr(sync_routes, "transaction", db.transaction)
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+
+    assert resp.status_code == 404
+    assert conn.rolled_back and not conn.committed

@@ -75,6 +75,12 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
     # Restore the stock and drop the reservation row in one transaction, so
     # a failure in either statement rolls back both: the reservation is
     # never cleared unless its stock was actually returned.
+    #
+    # Releasing is idempotent: a reservation that is already gone yields 404
+    # (above) and never touches stock. The DELETE's rowcount is the claim on
+    # the reservation -- if a concurrent release removed the row between the
+    # lookup and this transaction, zero rows are deleted and we raise, which
+    # rolls back our stock restore so it can never be applied twice.
     with transaction() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -86,5 +92,7 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
             "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s",
             (order_id, x_tenant_id),
         )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="no such reservation")
     cache.invalidate(cache.stock_key(res["sku"]))
     return {"order_id": order_id, "released": res["quantity"]}
