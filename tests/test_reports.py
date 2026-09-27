@@ -163,3 +163,150 @@ def test_import_snapshot_rejects_malformed_entry(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 400
+
+
+def _seed_import_items(fake_db):
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    fake_db.add_item(sku="B", warehouse_id="w1", quantity=2, tenant_id="tenant-a")
+    fake_db.add_item(sku="C", warehouse_id="w1", quantity=3, tenant_id="tenant-a")
+
+
+def _quantities(fake_db):
+    return {r["sku"]: r["quantity"] for r in fake_db.items}
+
+
+def test_import_snapshot_malformed_later_entry_applies_nothing(client, fake_db):
+    _seed_import_items(fake_db)
+    before = _quantities(fake_db)
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": "not-a-number"},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": "malformed snapshot entry"}
+    assert _quantities(fake_db) == before
+
+
+def test_import_snapshot_malformed_entry_anywhere_applies_nothing(client, fake_db):
+    _seed_import_items(fake_db)
+    before = _quantities(fake_db)
+    for bad in ({"sku": "B", "warehouse_id": "w1"}, "garbage", None):
+        resp = client.post(
+            "/reports/import",
+            json={
+                "items": [
+                    {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                    bad,
+                    {"sku": "C", "warehouse_id": "w1", "quantity": 30},
+                ]
+            },
+            headers=TENANT_A,
+        )
+        assert resp.status_code == 400
+        assert _quantities(fake_db) == before
+
+
+class _FailingWriteError(Exception):
+    pass
+
+
+class _BufferingConnection:
+    """A psycopg2-like connection over the FakeDB with real rollback:
+    writes are buffered and only land on the store at ``commit()``."""
+
+    def __init__(self, fake_db, fail_on_statement):
+        self._fake_db = fake_db
+        self._fail_on = fail_on_statement
+        self._pending = []
+        self._seen = 0
+
+    def cursor(self, cursor_factory=None):
+        return self
+
+    def execute(self, sql, params=()):
+        self._seen += 1
+        if self._seen == self._fail_on:
+            raise _FailingWriteError("simulated DB failure")
+        self._pending.append((sql, params))
+
+    def commit(self):
+        for sql, params in self._pending:
+            self._fake_db.execute(sql, params)
+        self._pending = []
+
+    def rollback(self):
+        self._pending = []
+
+    def close(self):
+        pass
+
+
+def _use_real_transaction(monkeypatch, fake_db, fail_on_statement=None):
+    from app import db as db_module
+    from app.routes import reports as reports_routes
+
+    monkeypatch.setattr(
+        db_module,
+        "get_connection",
+        lambda: _BufferingConnection(fake_db, fail_on_statement),
+    )
+    monkeypatch.setattr(reports_routes, "transaction", db_module.transaction)
+
+
+def test_import_snapshot_write_failure_rolls_back_all(monkeypatch, fake_db):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    _seed_import_items(fake_db)
+    before = _quantities(fake_db)
+    _use_real_transaction(monkeypatch, fake_db, fail_on_statement=3)
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": 30},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 500
+    assert _quantities(fake_db) == before
+
+
+def test_import_snapshot_valid_snapshot_applies_all_in_one_transaction(
+    client, monkeypatch, fake_db
+):
+    _seed_import_items(fake_db)
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=7, tenant_id="tenant-b")
+    _use_real_transaction(monkeypatch, fake_db)
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": "20"},
+                {"sku": "C", "warehouse_id": "w1", "quantity": 30},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"items": 3, "snapshot": '{"received": 3}'}
+    by_tenant = {(r["sku"], r["tenant_id"]): r["quantity"] for r in fake_db.items}
+    assert by_tenant == {
+        ("A", "tenant-a"): 10,
+        ("B", "tenant-a"): 20,
+        ("C", "tenant-a"): 30,
+        ("A", "tenant-b"): 7,
+    }
