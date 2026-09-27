@@ -225,3 +225,64 @@ def test_release_reservation_delete_miss_fails_release(client, fake_db, monkeypa
     )
     assert resp.status_code == 500
     assert resp.json()["detail"] == "failed to release reservation"
+
+
+def _stock(client, sku, warehouse_id, tenant_id):
+    resp = client.get(
+        f"/items/{sku}/stock",
+        params={"warehouse_id": warehouse_id},
+        headers={"X-Tenant-Id": tenant_id},
+    )
+    assert resp.status_code == 200
+    return resp.json()["quantity"]
+
+
+def test_release_reservation_invalidates_cached_stock(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    # Populate the cache with the pre-release quantity.
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 5
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 8
+
+
+def test_release_reservation_leaves_other_tenant_and_warehouse_cache(client, fake_db):
+    from app import cache
+
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=7, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=11, tenant_id="tenant-b")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    # Each tenant/warehouse gets its own cache entry, not a shared one.
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 5
+    assert _stock(client, "WIDGET", "w2", "tenant-a") == 7
+    assert _stock(client, "WIDGET", "w1", "tenant-b") == 11
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+
+    assert cache.get(cache.stock_key("tenant-a", "w1", "WIDGET")) is None
+    assert cache.get(cache.stock_key("tenant-a", "w2", "WIDGET")) == 7
+    assert cache.get(cache.stock_key("tenant-b", "w1", "WIDGET")) == 11
+    assert _stock(client, "WIDGET", "w1", "tenant-a") == 8
+    assert _stock(client, "WIDGET", "w2", "tenant-a") == 7
+    assert _stock(client, "WIDGET", "w1", "tenant-b") == 11

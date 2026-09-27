@@ -122,6 +122,7 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
     if res is None:
         raise HTTPException(status_code=404, detail="no such reservation")
 
-    # Only reached after a successful commit.
-    cache.invalidate(cache.stock_key(res["sku"]))
+    # Only reached after a successful commit that restored stock. Invalidate
+    # the exact key GET /items/{sku}/stock reads for this tenant+warehouse+sku.
+    cache.invalidate(cache.stock_key(x_tenant_id, res["warehouse_id"], res["sku"]))
     return {"order_id": order_id, "released": res["quantity"]}
