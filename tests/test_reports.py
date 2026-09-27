@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 TENANT_A = {"X-Tenant-Id": "tenant-a"}
 
@@ -79,3 +79,42 @@ def test_import_snapshot_rejects_malformed_entry(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 400
+
+
+def test_utc_start_of_day_converts_aware_input_to_utc_date():
+    from app.routes.reports import utc_start_of_day
+
+    # 23:30 at UTC-5 on Jan 1 is 04:30 UTC on Jan 2.
+    local = datetime(2024, 1, 1, 23, 30, tzinfo=timezone(timedelta(hours=-5)))
+    result = utc_start_of_day(local)
+    assert result == datetime(2024, 1, 2, tzinfo=timezone.utc)
+    assert result.utcoffset() == timedelta(0)
+
+
+def test_utc_start_of_day_default_is_current_utc_midnight():
+    from app.routes.reports import utc_start_of_day
+
+    result = utc_start_of_day()
+    assert result.tzinfo is not None
+    assert result.utcoffset() == timedelta(0)
+    assert result.date() == datetime.now(timezone.utc).date()
+    assert (result.hour, result.minute, result.second, result.microsecond) == (0, 0, 0, 0)
+
+
+def test_todays_movements_queries_with_aware_utc_boundary(client, monkeypatch):
+    from app.routes import reports
+
+    captured = {}
+
+    def fake_fetch_all(sql, params=()):
+        captured["params"] = params
+        return []
+
+    monkeypatch.setattr(reports, "fetch_all", fake_fetch_all)
+    resp = client.get("/reports/today", headers=TENANT_A)
+    assert resp.status_code == 200
+    boundary = captured["params"][1]
+    assert boundary.tzinfo is not None
+    assert boundary.utcoffset() == timedelta(0)
+    assert boundary == reports.utc_start_of_day()
+    assert resp.json()["date"] == boundary.date().isoformat()
