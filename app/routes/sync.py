@@ -94,5 +94,8 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
         )
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="no such reservation")
+    # Only reached once the release has committed (the 404 / rollback paths
+    # raise above), so stock actually changed. Use the same key helper the
+    # GET /items/{sku}/stock handler reads through, so the next read is fresh.
     cache.invalidate(cache.stock_key(res["sku"]))
     return {"order_id": order_id, "released": res["quantity"]}

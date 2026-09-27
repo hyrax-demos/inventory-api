@@ -227,3 +227,46 @@ def test_release_reservation_rolls_back_restore_when_already_released(
 
     assert resp.status_code == 404
     assert conn.rolled_back and not conn.committed
+
+
+def test_release_reservation_invalidates_cached_stock(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    headers = {"X-Tenant-Id": "tenant-a"}
+    params = {"warehouse_id": "w1"}
+
+    # Prime the stock cache with the pre-release quantity.
+    primed = client.get("/items/WIDGET/stock", params=params, headers=headers)
+    assert primed.status_code == 200
+    assert primed.json()["quantity"] == 5
+
+    released = client.post("/reservations/order-1/release", headers=headers)
+    assert released.status_code == 200
+
+    fresh = client.get("/items/WIDGET/stock", params=params, headers=headers)
+    assert fresh.status_code == 200
+    assert fresh.json()["quantity"] == 8
+
+
+def test_release_reservation_noop_does_not_invalidate_cache(
+    client, fake_db, monkeypatch
+):
+    from app import cache
+    from app.routes import sync as sync_routes
+
+    invalidated: list[str] = []
+    monkeypatch.setattr(sync_routes.cache, "invalidate", invalidated.append)
+    cache.put(cache.stock_key("WIDGET"), 8)
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+
+    assert resp.status_code == 404
+    assert invalidated == []
