@@ -126,3 +126,70 @@ def test_reserve_stock_missing_item(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 404
+
+
+def _walk_pages(client, headers, **params):
+    """Follow next_cursor until exhausted; return (all ids, page count)."""
+    ids: list[str] = []
+    pages = 0
+    cursor = None
+    while True:
+        query = dict(params)
+        if cursor is not None:
+            query["cursor"] = cursor
+        resp = client.get("/items", params=query, headers=headers)
+        assert resp.status_code == 200
+        body = resp.json()
+        pages += 1
+        ids.extend(i["id"] for i in body["items"])
+        cursor = body["next_cursor"]
+        if cursor is None:
+            return ids, pages
+        assert pages < 100, "pagination did not terminate"
+
+
+def test_search_items_pages_have_no_duplicates_or_gaps(client, fake_db):
+    for n_items in range(13):
+        for limit in range(1, 6):
+            fake_db.items.clear()
+            for i in range(n_items):
+                fake_db.add_item(
+                    sku=f"SKU{i}", name=f"item {i}", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
+                )
+            expected = sorted((r["id"] for r in fake_db.items), key=int)
+            ids, pages = _walk_pages(client, TENANT_A, limit=limit)
+            assert ids == expected, (n_items, limit)
+            assert pages == max(1, -(-n_items // limit)), (n_items, limit)
+
+
+def test_search_items_next_cursor_absent_on_exact_final_page(client, fake_db):
+    for i in range(4):
+        fake_db.add_item(sku=f"SKU{i}", name=f"item {i}", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    first = client.get("/items", params={"limit": 2}, headers=TENANT_A).json()
+    assert first["next_cursor"] == first["items"][-1]["id"]
+    second = client.get("/items", params={"limit": 2, "cursor": first["next_cursor"]}, headers=TENANT_A).json()
+    assert len(second["items"]) == 2
+    assert second["next_cursor"] is None
+
+
+def test_search_items_pagination_respects_filters_and_tenant(client, fake_db):
+    expected = []
+    for i in range(15):
+        # interleave rows that each filter must exclude
+        wh = "w1" if i % 3 else "w2"
+        name = f"widget {i}" if i % 2 else f"gadget {i}"
+        row = fake_db.add_item(sku=f"A{i}", name=name, warehouse_id=wh, quantity=1, tenant_id="tenant-a")
+        fake_db.add_item(sku=f"B{i}", name=name, warehouse_id=wh, quantity=1, tenant_id="tenant-b")
+        if wh == "w1" and name.startswith("widget"):
+            expected.append(row["id"])
+    assert len(expected) > 3
+    for limit in (1, 2, 3, 50):
+        ids, _ = _walk_pages(client, TENANT_A, limit=limit, warehouse_id="w1", q="widget")
+        assert ids == expected, limit
+
+
+def test_search_items_rejects_non_positive_limit(client, fake_db):
+    fake_db.add_item(sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    for bad in (0, -1):
+        resp = client.get("/items", params={"limit": bad}, headers=TENANT_A)
+        assert resp.status_code == 422
