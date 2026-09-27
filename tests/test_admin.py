@@ -36,7 +36,9 @@ def test_delete_item_not_found(client, fake_db):
 
 
 def test_update_item(client, fake_db):
-    row = fake_db.add_item(sku="A", name="old", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    row = fake_db.add_item(
+        sku="A", name="old", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
+    )
     resp = client.post(
         f"/admin/items/{row['id']}/update",
         json={"name": "new"},
@@ -74,10 +76,16 @@ def test_bulk_adjust_invalidates_stock_in_every_warehouse(client, fake_db):
     fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=2, tenant_id="tenant-a")
     for wh in ("w1", "w2"):
         client.get("/items/WIDGET/stock", params={"warehouse_id": wh}, headers=headers)
-    resp = client.post("/admin/items/bulk-adjust", json=[{"sku": "WIDGET", "delta": 5}], headers=headers)
+    resp = client.post(
+        "/admin/items/bulk-adjust",
+        json=[{"sku": "WIDGET", "delta": 5}],
+        headers=headers,
+    )
     assert resp.status_code == 200
     got = {
-        wh: client.get("/items/WIDGET/stock", params={"warehouse_id": wh}, headers=headers).json()["quantity"]
+        wh: client.get(
+            "/items/WIDGET/stock", params={"warehouse_id": wh}, headers=headers
+        ).json()["quantity"]
         for wh in ("w1", "w2")
     }
     assert got == {"w1": 6, "w2": 7}
