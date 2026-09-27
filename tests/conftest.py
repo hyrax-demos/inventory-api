@@ -4,6 +4,7 @@ Everything runs in-process against a FakeDB: no Postgres, no network, no
 real secrets. Environment variables the app reads at import time are set
 before ``app.main`` is imported for the first time.
 """
+
 import re
 import os
 from contextlib import contextmanager
@@ -153,7 +154,11 @@ class FakeDB:
         if sql.startswith("SELECT * FROM items WHERE sku = %s AND tenant_id = %s"):
             sku, tenant_id = params
             return next(
-                (dict(r) for r in self.items if r["sku"] == sku and r["tenant_id"] == tenant_id),
+                (
+                    dict(r)
+                    for r in self.items
+                    if r["sku"] == sku and r["tenant_id"] == tenant_id
+                ),
                 None,
             )
         if sql.startswith("SELECT quantity FROM items"):
@@ -200,9 +205,11 @@ class FakeDB:
         if sql.startswith("UPDATE items SET quantity = quantity - %s"):
             delta, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", r["quantity"] - delta),
             )
 
@@ -219,7 +226,10 @@ class FakeDB:
             )
             return 1
 
-        if sql.startswith("UPDATE items SET") and "WHERE id = %s AND tenant_id = %s" in sql:
+        if (
+            sql.startswith("UPDATE items SET")
+            and "WHERE id = %s AND tenant_id = %s" in sql
+        ):
             *values, item_id, tenant_id = params
             cols = re.findall(r"(\w+) = %s", sql.split("WHERE")[0])
             return self._update_items(
@@ -230,27 +240,36 @@ class FakeDB:
         if sql.startswith("UPDATE items SET quantity = %s"):
             quantity, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", quantity),
             )
 
         if sql.startswith("UPDATE items SET price = %s"):
             price, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("price", price),
             )
 
-        if sql.startswith("UPDATE items SET quantity = quantity + %s") and "warehouse_id = %s" in sql:
+        if (
+            sql.startswith("UPDATE items SET quantity = quantity + %s")
+            and "warehouse_id = %s" in sql
+        ):
             delta, sku, warehouse_id, tenant_id = params
             return self._update_items(
-                lambda r: r["sku"] == sku
-                and r["warehouse_id"] == warehouse_id
-                and r["tenant_id"] == tenant_id,
+                lambda r: (
+                    r["sku"] == sku
+                    and r["warehouse_id"] == warehouse_id
+                    and r["tenant_id"] == tenant_id
+                ),
                 lambda r: r.__setitem__("quantity", r["quantity"] + delta),
             )
 
@@ -282,7 +301,9 @@ class FakeDB:
             item_id, tenant_id = params
             before = len(self.items)
             self.items = [
-                r for r in self.items if not (r["id"] == item_id and r["tenant_id"] == tenant_id)
+                r
+                for r in self.items
+                if not (r["id"] == item_id and r["tenant_id"] == tenant_id)
             ]
             return before - len(self.items)
 
@@ -299,38 +320,54 @@ class FakeDB:
     # -- transaction --
     # A stand-in for ``app.db.transaction()``, for a fix that wraps more than
     # one statement in a single transaction (e.g. an atomic release or an
-    # all-or-nothing import). It has no real rollback semantics -- each
-    # statement lands on the same in-memory store ``execute`` already uses --
-    # so it exists only so route code that does
-    # ``with transaction() as conn: conn.cursor().execute(...)`` has
-    # something to call. Atomicity itself is graded by a lower-layer fake
-    # connection in the oracle for the tasks that need it, per the bench
-    # brief's "fake at the lowest layer" rule.
+    # all-or-nothing import). Mutating statements issued through the
+    # connection/cursor this yields are buffered rather than applied
+    # immediately: they only land on ``self.items``/``self.reservations``/
+    # ``self.movements`` when the connection's ``commit()`` runs. A
+    # ``rollback()``, or an exception propagating out of the ``with
+    # transaction() as conn:`` block, discards the buffer instead -- so
+    # route code that fails partway through a multi-statement transaction
+    # leaves every prior statement in that same transaction unapplied, the
+    # same as a real Postgres rollback.
     @contextmanager
     def transaction(self):
-        yield _FakeConnection(self)
+        conn = _FakeConnection(self)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 class _FakeConnection:
     def __init__(self, fake_db: "FakeDB"):
         self._fake_db = fake_db
+        self._pending: list[tuple[str, tuple]] = []
 
     def cursor(self, cursor_factory=None):
-        return _FakeCursor(self._fake_db)
+        return _FakeCursor(self._fake_db, self._pending)
 
     def commit(self) -> None:
-        pass
+        # Apply every buffered write, in order, to the real store. If this
+        # is called more than once (as a route module's own commit plus the
+        # transaction() wrapper's commit might do), only the first call has
+        # anything left to apply.
+        pending, self._pending = self._pending, []
+        for sql, params in pending:
+            self._fake_db.execute(sql, params)
 
     def rollback(self) -> None:
-        pass
+        self._pending = []
 
     def close(self) -> None:
         pass
 
 
 class _FakeCursor:
-    def __init__(self, fake_db: "FakeDB"):
+    def __init__(self, fake_db: "FakeDB", pending: list):
         self._fake_db = fake_db
+        self._pending = pending
         self._rowcount = 0
         self._rows: list = []
 
@@ -338,7 +375,9 @@ class _FakeCursor:
         if sql.lstrip().upper().startswith("SELECT"):
             self._rows = self._fake_db.fetch_all(sql, params)
         else:
-            self._rowcount = self._fake_db.execute(sql, params)
+            # Buffered, not applied yet -- see _FakeConnection.commit().
+            self._pending.append((sql, params))
+            self._rowcount = 1
 
     def fetchall(self):
         return self._rows

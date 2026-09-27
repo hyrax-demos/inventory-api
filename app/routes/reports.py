@@ -5,7 +5,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Header, HTTPException
 
-from app.db import execute, fetch_all
+from app.db import fetch_all, transaction
 from app.routes.items import _tenant
 
 router = APIRouter()
@@ -70,7 +70,10 @@ async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
     items = payload.get("items")
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="items must be a list")
-    count = 0
+
+    # Validate every entry before writing anything, so a malformed entry
+    # anywhere in the list can never leave earlier entries partially applied.
+    parsed_entries = []
     for entry in items:
         try:
             sku = entry["sku"]
@@ -78,10 +81,16 @@ async def import_snapshot(payload: dict, x_tenant_id: str = Header()):
             quantity = int(entry["quantity"])
         except (KeyError, TypeError, ValueError):
             raise HTTPException(status_code=400, detail="malformed snapshot entry")
-        execute(
-            "UPDATE items SET quantity = %s "
-            "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-            (quantity, sku, warehouse_id, x_tenant_id),
-        )
-        count += 1
+        parsed_entries.append((sku, warehouse_id, quantity))
+
+    count = 0
+    with transaction() as conn:
+        cur = conn.cursor()
+        for sku, warehouse_id, quantity in parsed_entries:
+            cur.execute(
+                "UPDATE items SET quantity = %s "
+                "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
+                (quantity, sku, warehouse_id, x_tenant_id),
+            )
+            count += 1
     return {"items": count, "snapshot": json.dumps({"received": count})}
