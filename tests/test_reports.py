@@ -161,3 +161,113 @@ def test_import_snapshot_rejects_malformed_entry(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 400
+
+
+def _install_rollback_transaction(monkeypatch, fake_db):
+    """Replace the route's transaction() with one that restores the item
+    store if the block raises, mirroring app.db.transaction's rollback."""
+    import copy
+    from contextlib import contextmanager
+
+    from app.routes import reports as reports_routes
+
+    real = fake_db.transaction
+
+    @contextmanager
+    def rolling_back_transaction():
+        saved = copy.deepcopy(fake_db.items)
+        try:
+            with real() as conn:
+                yield conn
+        except Exception:
+            fake_db.items = saved
+            raise
+
+    monkeypatch.setattr(reports_routes, "transaction", rolling_back_transaction)
+
+
+def _quantities(fake_db):
+    return {r["sku"]: r["quantity"] for r in fake_db.items}
+
+
+def test_import_snapshot_malformed_last_entry_writes_nothing(
+    client, fake_db, monkeypatch
+):
+    _install_rollback_transaction(monkeypatch, fake_db)
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    fake_db.add_item(sku="B", warehouse_id="w1", quantity=2, tenant_id="tenant-a")
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": "not-a-number"},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 400
+    assert _quantities(fake_db) == {"A": 1, "B": 2}
+
+
+def test_import_snapshot_write_failure_mid_list_rolls_back(fake_db, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+    from app.routes import reports as reports_routes
+
+    _install_rollback_transaction(monkeypatch, fake_db)
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    fake_db.add_item(sku="B", warehouse_id="w1", quantity=2, tenant_id="tenant-a")
+    fake_db.add_item(sku="C", warehouse_id="w1", quantity=3, tenant_id="tenant-a")
+
+    real_apply = reports_routes._apply_stock_update
+    calls = {"n": 0}
+
+    def flaky_apply(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated write failure")
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(reports_routes, "_apply_stock_update", flaky_apply)
+
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": 30},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 500
+    assert calls["n"] == 2
+    assert _quantities(fake_db) == {"A": 1, "B": 2, "C": 3}
+
+
+def test_import_snapshot_valid_snapshot_applies_all_entries(
+    client, fake_db, monkeypatch
+):
+    _install_rollback_transaction(monkeypatch, fake_db)
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    fake_db.add_item(sku="B", warehouse_id="w1", quantity=2, tenant_id="tenant-a")
+    fake_db.add_item(sku="C", warehouse_id="w1", quantity=3, tenant_id="tenant-a")
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": 30},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["items"] == 3
+    assert _quantities(fake_db) == {"A": 10, "B": 20, "C": 30}
