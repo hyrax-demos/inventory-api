@@ -253,3 +253,70 @@ def test_release_after_failed_restore_can_be_retried_once(fake_db, monkeypatch):
         client.post("/reservations/order-1/release", headers=headers).status_code == 404
     )
     assert fake_db.items[0]["quantity"] == 8
+
+
+def _get_stock(client, tenant, warehouse_id, sku="WIDGET"):
+    resp = client.get(
+        f"/items/{sku}/stock",
+        params={"warehouse_id": warehouse_id},
+        headers={"X-Tenant-Id": tenant},
+    )
+    assert resp.status_code == 200
+    return resp.json()["quantity"]
+
+
+def test_release_invalidates_stock_cache_for_get_stock(client, fake_db):
+    _seed_reservation(fake_db)
+    # Prime the cache that GET /items/{sku}/stock reads.
+    assert _get_stock(client, "tenant-a", "w1") == 5
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+
+    # The freshly restored quantity, not the cached 5.
+    assert _get_stock(client, "tenant-a", "w1") == 8
+
+
+def test_release_does_not_evict_other_tenant_or_warehouse_stock_cache(client, fake_db):
+    from app import cache
+
+    _seed_reservation(fake_db)
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=11, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=7, tenant_id="tenant-b")
+
+    # Each tenant/warehouse gets its own cache entry and its own quantity.
+    assert _get_stock(client, "tenant-a", "w1") == 5
+    assert _get_stock(client, "tenant-a", "w2") == 11
+    assert _get_stock(client, "tenant-b", "w1") == 7
+
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 200
+
+    assert cache.get(cache.stock_key("tenant-a", "WIDGET", "w1")) is None
+    assert cache.get(cache.stock_key("tenant-a", "WIDGET", "w2")) == 11
+    assert cache.get(cache.stock_key("tenant-b", "WIDGET", "w1")) == 7
+    assert _get_stock(client, "tenant-a", "w1") == 8
+    assert _get_stock(client, "tenant-b", "w1") == 7
+
+
+def test_release_404_leaves_stock_cache_untouched(client, fake_db):
+    from app import cache
+
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    assert _get_stock(client, "tenant-a", "w1") == 5
+    resp = client.post(
+        "/reservations/missing/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 404
+    assert cache.get(cache.stock_key("tenant-a", "WIDGET", "w1")) == 5
+
+
+def test_stock_key_components_cannot_collide():
+    from app import cache
+
+    assert cache.stock_key("a:b", "c", "d") != cache.stock_key("a", "b:c", "d")
+    assert cache.stock_key("t", "s", "w") != cache.stock_key("t", "s", "w2")

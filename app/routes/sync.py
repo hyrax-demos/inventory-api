@@ -92,5 +92,7 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
 
     if claimed is None:
         raise HTTPException(status_code=404, detail="no such reservation")
-    cache.invalidate(cache.stock_key(sku))
+    # Only after the transaction committed: evict exactly the key
+    # GET /items/{sku}/stock reads for this tenant + warehouse + SKU.
+    cache.invalidate_stock(x_tenant_id, sku, warehouse_id)
     return {"order_id": order_id, "released": quantity}
