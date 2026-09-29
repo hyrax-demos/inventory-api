@@ -145,3 +145,87 @@ def test_reserved_value_not_priced_from_other_tenant_item(client, fake_db):
     resp = client.get("/reports/reserved-value", headers=TENANT_A)
     assert resp.status_code == 200
     assert resp.json()["lines"] == []
+
+
+def _seed_three(fake_db):
+    for sku in ("A", "B", "C"):
+        fake_db.add_item(sku=sku, warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+
+
+def _qty(fake_db, sku):
+    return next(r["quantity"] for r in fake_db.items if r["sku"] == sku)
+
+
+def test_import_snapshot_applies_every_entry(client, fake_db):
+    _seed_three(fake_db)
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": s, "warehouse_id": "w1", "quantity": q}
+                for s, q in (("A", 10), ("B", 20), ("C", 30))
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["items"] == 3
+    assert [_qty(fake_db, s) for s in "ABC"] == [10, 20, 30]
+
+
+def test_import_snapshot_malformed_last_entry_writes_nothing(client, fake_db):
+    _seed_three(fake_db)
+    resp = client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": "A", "warehouse_id": "w1", "quantity": 10},
+                {"sku": "B", "warehouse_id": "w1", "quantity": 20},
+                {"sku": "C", "warehouse_id": "w1", "quantity": "not-a-number"},
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "malformed snapshot entry"
+    assert [_qty(fake_db, s) for s in "ABC"] == [1, 1, 1]
+
+
+def test_import_snapshot_write_failure_rolls_back(client, fake_db, monkeypatch):
+    from app.routes import reports as reports_routes
+
+    _seed_three(fake_db)
+    real_execute = fake_db.execute
+    calls = {"n": 0}
+
+    def failing_execute(sql, params=()):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated DB failure")
+        return real_execute(sql, params)
+
+    # Route the per-entry write through the failing fake at every layer.
+    monkeypatch.setattr(fake_db, "execute", failing_execute)
+    monkeypatch.setattr(reports_routes, "execute", failing_execute, raising=False)
+
+    # Exercise the production app.db.transaction(): only its connection is
+    # faked, so commit/rollback are driven by the real context manager.
+    from app import db as db_module
+    from conftest import _FakeConnection
+
+    monkeypatch.setattr(db_module, "get_connection", lambda: _FakeConnection(fake_db))
+    monkeypatch.setattr(reports_routes, "transaction", db_module.transaction)
+
+    safe_client = type(client)(client.app, raise_server_exceptions=False)
+    resp = safe_client.post(
+        "/reports/import",
+        json={
+            "items": [
+                {"sku": s, "warehouse_id": "w1", "quantity": q}
+                for s, q in (("A", 10), ("B", 20), ("C", 30))
+            ]
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code >= 500
+    assert [_qty(fake_db, s) for s in "ABC"] == [1, 1, 1]
