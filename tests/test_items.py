@@ -126,3 +126,53 @@ def test_reserve_stock_missing_item(client, fake_db):
         headers=TENANT_A,
     )
     assert resp.status_code == 404
+
+
+def _stock(client, sku, warehouse_id, headers):
+    resp = client.get(f"/items/{sku}/stock", params={"warehouse_id": warehouse_id}, headers=headers)
+    assert resp.status_code == 200
+    return resp.json()["quantity"]
+
+
+def test_get_stock_cache_scoped_by_warehouse(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=3, tenant_id="tenant-a")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    assert _stock(client, "WIDGET", "w2", TENANT_A) == 3
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+
+
+def test_get_stock_cache_scoped_by_tenant(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=4, tenant_id="tenant-b")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    assert _stock(client, "WIDGET", "w1", TENANT_B) == 4
+
+
+def test_get_stock_cache_does_not_leak_across_tenants_for_missing_item(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    resp = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_B)
+    assert resp.status_code == 404
+
+
+def test_stock_key_components_cannot_collide():
+    from app import cache
+
+    assert cache.stock_key("t:a", "w", "s") != cache.stock_key("t", "a:w", "s")
+    assert cache.stock_key("t", "w1", "s:x") != cache.stock_key("t", "x:w1", "s")
+
+
+def test_reserve_invalidates_cached_stock_for_that_warehouse(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=5, tenant_id="tenant-a")
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 10
+    assert _stock(client, "WIDGET", "w2", TENANT_A) == 5
+    resp = client.post(
+        "/items/reserve",
+        json={"sku": "WIDGET", "warehouse_id": "w1", "quantity": 3, "order_id": "order-1"},
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+    assert _stock(client, "WIDGET", "w1", TENANT_A) == 7
+    assert _stock(client, "WIDGET", "w2", TENANT_A) == 5
