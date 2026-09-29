@@ -68,10 +68,21 @@ def _rollback_transaction(fake_db, fail_on):
     from contextlib import contextmanager
 
     class _Cursor:
+        def __init__(self):
+            self._rows: list = []
+            self.rowcount = 0
+
         def execute(self, sql, params=()):
             if sql.startswith(fail_on):
                 raise RuntimeError(f"simulated failure: {fail_on}")
-            self.rowcount = fake_db.execute(sql, params)
+            if "RETURNING" in sql:
+                self._rows = fake_db.execute_returning(sql, params)
+                self.rowcount = len(self._rows)
+            else:
+                self.rowcount = fake_db.execute(sql, params)
+
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
 
     class _Conn:
         def cursor(self, cursor_factory=None):
@@ -174,3 +185,71 @@ def test_release_reservation_rolls_back_stock_when_delete_fails(fake_db, monkeyp
     # The restore ran inside the same transaction and was rolled back with it.
     assert fake_db.items[0]["quantity"] == 5
     assert len(fake_db.reservations) == 1
+
+
+def test_release_reservation_twice_restores_stock_once(client, fake_db):
+    _seed_reservation(fake_db)
+    headers = {"X-Tenant-Id": "tenant-a"}
+
+    first = client.post("/reservations/order-1/release", headers=headers)
+    assert first.status_code == 200
+    assert first.json()["released"] == 3
+    assert fake_db.items[0]["quantity"] == 8
+
+    second = client.post("/reservations/order-1/release", headers=headers)
+    assert second.status_code == 404
+    # Stock was restored exactly once.
+    assert fake_db.items[0]["quantity"] == 8
+    assert fake_db.reservations == []
+
+
+def test_release_missing_reservation_does_not_touch_stock(client, fake_db):
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+
+
+def test_release_other_tenants_reservation_is_404_and_keeps_stock(client, fake_db):
+    _seed_reservation(fake_db)
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-b"}
+    )
+    assert resp.status_code == 404
+    assert fake_db.items[0]["quantity"] == 5
+    assert len(fake_db.reservations) == 1
+
+
+def test_release_after_failed_restore_can_be_retried_once(fake_db, monkeypatch):
+    """A rolled-back release leaves the reservation claimable; the retry
+    restores stock once and a further release is a 404."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+    from app.routes import sync as sync_routes
+
+    _seed_reservation(fake_db)
+    headers = {"X-Tenant-Id": "tenant-a"}
+    with monkeypatch.context() as m:
+        m.setattr(
+            sync_routes,
+            "transaction",
+            _rollback_transaction(fake_db, "UPDATE items SET quantity = quantity + %s"),
+        )
+        failing = TestClient(app, raise_server_exceptions=False)
+        assert (
+            failing.post("/reservations/order-1/release", headers=headers).status_code
+            == 500
+        )
+
+    client = TestClient(app)
+    assert (
+        client.post("/reservations/order-1/release", headers=headers).status_code == 200
+    )
+    assert fake_db.items[0]["quantity"] == 8
+    assert (
+        client.post("/reservations/order-1/release", headers=headers).status_code == 404
+    )
+    assert fake_db.items[0]["quantity"] == 8

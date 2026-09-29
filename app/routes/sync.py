@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache, config
 from app.auth import require_admin
-from app.db import execute, fetch_one, transaction
+from app.db import execute, transaction
 
 router = APIRouter()
 
@@ -63,28 +63,34 @@ def release_reservation(order_id: str, x_tenant_id: str = Header()):
 
     Called on order cancellation. Returns the stock to the item it was held
     against and clears the reservation row.
-    """
-    res = fetch_one(
-        "SELECT sku, warehouse_id, quantity FROM reservations "
-        "WHERE order_id = %s AND tenant_id = %s",
-        (order_id, x_tenant_id),
-    )
-    if res is None:
-        raise HTTPException(status_code=404, detail="no such reservation")
 
-    # Restore the held stock and drop the reservation row in one transaction:
-    # if either statement fails, both roll back, so the reservation survives
-    # and still records the stock that has not been returned yet.
+    Safe to call more than once: the reservation row is claimed by a
+    ``DELETE ... RETURNING`` inside the transaction, and only the call that
+    actually deleted it restores stock. A repeated (or concurrent) release
+    finds no row and gets a 404 without touching stock.
+    """
+    # Claim the reservation and restore its stock in one transaction. The
+    # DELETE row-locks the reservation, so a concurrent release blocks until
+    # this one commits and then deletes nothing. If the stock restore fails,
+    # the whole transaction rolls back and the reservation survives, still
+    # recording the stock that has not been returned yet.
     with transaction() as conn:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE items SET quantity = quantity + %s "
-            "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
-            (res["quantity"], res["sku"], res["warehouse_id"], x_tenant_id),
-        )
-        cur.execute(
-            "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s",
+            "DELETE FROM reservations WHERE order_id = %s AND tenant_id = %s "
+            "RETURNING sku, warehouse_id, quantity",
             (order_id, x_tenant_id),
         )
-    cache.invalidate(cache.stock_key(res["sku"]))
-    return {"order_id": order_id, "released": res["quantity"]}
+        claimed = cur.fetchone()
+        if claimed is not None:
+            sku, warehouse_id, quantity = claimed
+            cur.execute(
+                "UPDATE items SET quantity = quantity + %s "
+                "WHERE sku = %s AND warehouse_id = %s AND tenant_id = %s",
+                (quantity, sku, warehouse_id, x_tenant_id),
+            )
+
+    if claimed is None:
+        raise HTTPException(status_code=404, detail="no such reservation")
+    cache.invalidate(cache.stock_key(sku))
+    return {"order_id": order_id, "released": quantity}
