@@ -4,6 +4,7 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
+from app import cache
 from app import db as db_module
 from app.main import app
 from app.routes import sync as sync_routes
@@ -249,3 +250,53 @@ def test_release_other_tenants_reservation_leaves_stock_unchanged(
     assert resp.status_code == 404
     assert fake_db.items[0]["quantity"] == 5
     assert len(fake_db.reservations) == 1
+
+
+# -- stock cache invalidation on release ---------------------------------------
+# GET /items/{sku}/stock (app/routes/items.py::get_stock) reads and writes the
+# key built by ``cache.stock_key(sku)``; release_reservation invalidates the
+# key from that same builder once its transaction commits, so the next read
+# reflects the restored quantity instead of the pre-release snapshot.
+
+
+def _warm_then_release_then_read(client, fake_db):
+    tenant = {"X-Tenant-Id": "tenant-a"}
+    params = {"warehouse_id": "w1"}
+
+    warm = client.get("/items/WIDGET/stock", params=params, headers=tenant)
+    assert warm.status_code == 200
+    assert warm.json()["quantity"] == 5
+    # The GET populated exactly the key the shared builder produces.
+    assert cache.get(cache.stock_key("WIDGET")) == 5
+
+    # Prove the cache is live: change the row behind its back and confirm the
+    # GET still serves the cached snapshot. Without this, an inert cache or a
+    # never-hit key would let the post-release assertion pass trivially.
+    fake_db.items[0]["quantity"] = 99
+    cached = client.get("/items/WIDGET/stock", params=params, headers=tenant)
+    assert cached.status_code == 200
+    assert cached.json()["quantity"] == 5
+    fake_db.items[0]["quantity"] = 5
+
+    released = client.post("/reservations/order-1/release", headers=tenant)
+    assert released.status_code == 200
+    assert cache.get(cache.stock_key("WIDGET")) is None
+
+    return client.get("/items/WIDGET/stock", params=params, headers=tenant)
+
+
+def test_release_reservation_invalidates_cached_stock(client, fake_db):
+    _seed(fake_db)
+    after = _warm_then_release_then_read(client, fake_db)
+    assert after.status_code == 200
+    assert after.json()["quantity"] == 8
+
+
+def test_release_reservation_invalidates_cached_stock_after_commit(
+    client, fake_db, real_txn
+):
+    _seed(fake_db)
+    after = _warm_then_release_then_read(client, fake_db)
+    assert after.status_code == 200
+    assert after.json()["quantity"] == 8
+    assert real_txn[0].committed
