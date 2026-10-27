@@ -3,12 +3,14 @@
 All endpoints require the shared admin token (``require_admin``) and are scoped
 to the caller's tenant.
 """
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import cache
 from app.auth import require_admin
 from app.db import execute
 from app.models import ItemUpdate, StockAdjustment
+from app.routes import items
 
 router = APIRouter(dependencies=[Depends(require_admin)])
 
@@ -38,9 +40,7 @@ def delete_item(item_id: str, x_tenant_id: str = Header()):
 def update_item(item_id: str, patch: ItemUpdate, x_tenant_id: str = Header()):
     """Apply a partial update to an item using only whitelisted columns."""
     fields = {
-        k: v
-        for k, v in patch.model_dump(exclude_unset=True).items()
-        if k in _PATCHABLE
+        k: v for k, v in patch.model_dump(exclude_unset=True).items() if k in _PATCHABLE
     }
     if not fields:
         raise HTTPException(status_code=400, detail="no patchable fields")
@@ -58,11 +58,15 @@ def update_item(item_id: str, patch: ItemUpdate, x_tenant_id: str = Header()):
 @router.post("/admin/items/bulk-adjust")
 def bulk_adjust(adjustments: list[StockAdjustment], x_tenant_id: str = Header()):
     """Apply stock deltas to many SKUs at once, scoped to the tenant."""
+    # Derive the tenant the way get_stock does, so the prefix dropped below
+    # covers the keys get_stock reads.
+    tenant_id = items._tenant(x_tenant_id)
     for adj in adjustments:
         execute(
             "UPDATE items SET quantity = quantity + %s "
             "WHERE sku = %s AND tenant_id = %s",
-            (adj.delta, adj.sku, x_tenant_id),
+            (adj.delta, adj.sku, tenant_id),
         )
-        cache.invalidate(cache.stock_key(adj.sku))
+        # The UPDATE touches this SKU in every warehouse, so drop them all.
+        cache.invalidate_prefix(cache.stock_sku_prefix(tenant_id, adj.sku))
     return {"adjusted": len(adjustments)}
