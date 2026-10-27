@@ -8,7 +8,9 @@ def test_get_item_missing_tenant_header_is_rejected(client):
 
 
 def test_get_item_found(client, fake_db):
-    fake_db.add_item(sku="WIDGET", name="Widget", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_item(
+        sku="WIDGET", name="Widget", warehouse_id="w1", quantity=5, tenant_id="tenant-a"
+    )
     resp = client.get("/items/WIDGET", headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
@@ -23,7 +25,13 @@ def test_get_item_not_found(client, fake_db):
 
 def test_search_items_returns_page(client, fake_db):
     for i in range(3):
-        fake_db.add_item(sku=f"SKU{i}", name=f"item {i}", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+        fake_db.add_item(
+            sku=f"SKU{i}",
+            name=f"item {i}",
+            warehouse_id="w1",
+            quantity=1,
+            tenant_id="tenant-a",
+        )
     resp = client.get("/items", headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
@@ -33,14 +41,22 @@ def test_search_items_returns_page(client, fake_db):
 
 def test_search_items_paginates(client, fake_db):
     for i in range(5):
-        fake_db.add_item(sku=f"SKU{i}", name=f"item {i}", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+        fake_db.add_item(
+            sku=f"SKU{i}",
+            name=f"item {i}",
+            warehouse_id="w1",
+            quantity=1,
+            tenant_id="tenant-a",
+        )
     resp = client.get("/items", params={"limit": 2}, headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
     assert len(body["items"]) == 2
     assert body["next_cursor"] is not None
 
-    resp2 = client.get("/items", params={"limit": 2, "cursor": body["next_cursor"]}, headers=TENANT_A)
+    resp2 = client.get(
+        "/items", params={"limit": 2, "cursor": body["next_cursor"]}, headers=TENANT_A
+    )
     assert resp2.status_code == 200
     body2 = resp2.json()
     assert len(body2["items"]) == 2
@@ -51,8 +67,12 @@ def test_search_items_paginates(client, fake_db):
 
 
 def test_search_items_filters_by_warehouse(client, fake_db):
-    fake_db.add_item(sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
-    fake_db.add_item(sku="B", name="b", warehouse_id="w2", quantity=1, tenant_id="tenant-a")
+    fake_db.add_item(
+        sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
+    )
+    fake_db.add_item(
+        sku="B", name="b", warehouse_id="w2", quantity=1, tenant_id="tenant-a"
+    )
     resp = client.get("/items", params={"warehouse_id": "w1"}, headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
@@ -60,8 +80,12 @@ def test_search_items_filters_by_warehouse(client, fake_db):
 
 
 def test_search_items_scoped_to_tenant(client, fake_db):
-    fake_db.add_item(sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
-    fake_db.add_item(sku="B", name="b", warehouse_id="w1", quantity=1, tenant_id="tenant-b")
+    fake_db.add_item(
+        sku="A", name="a", warehouse_id="w1", quantity=1, tenant_id="tenant-a"
+    )
+    fake_db.add_item(
+        sku="B", name="b", warehouse_id="w1", quantity=1, tenant_id="tenant-b"
+    )
     resp = client.get("/items", headers=TENANT_A)
     assert resp.status_code == 200
     body = resp.json()
@@ -70,7 +94,9 @@ def test_search_items_scoped_to_tenant(client, fake_db):
 
 def test_get_stock_returns_quantity(client, fake_db):
     fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=42, tenant_id="tenant-a")
-    resp = client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    resp = client.get(
+        "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A
+    )
     assert resp.status_code == 200
     body = resp.json()
     assert body["sku"] == "WIDGET"
@@ -78,7 +104,9 @@ def test_get_stock_returns_quantity(client, fake_db):
 
 
 def test_get_stock_not_found(client, fake_db):
-    resp = client.get("/items/NOPE/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    resp = client.get(
+        "/items/NOPE/stock", params={"warehouse_id": "w1"}, headers=TENANT_A
+    )
     assert resp.status_code == 404
 
 
@@ -86,7 +114,12 @@ def test_reserve_stock_happy_path(client, fake_db):
     fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
     resp = client.post(
         "/items/reserve",
-        json={"sku": "WIDGET", "warehouse_id": "w1", "quantity": 3, "order_id": "order-1"},
+        json={
+            "sku": "WIDGET",
+            "warehouse_id": "w1",
+            "quantity": 3,
+            "order_id": "order-1",
+        },
         headers=TENANT_A,
     )
     assert resp.status_code == 200
@@ -113,7 +146,12 @@ def test_reserve_stock_insufficient_quantity(client, fake_db):
     fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
     resp = client.post(
         "/items/reserve",
-        json={"sku": "WIDGET", "warehouse_id": "w1", "quantity": 5, "order_id": "order-1"},
+        json={
+            "sku": "WIDGET",
+            "warehouse_id": "w1",
+            "quantity": 5,
+            "order_id": "order-1",
+        },
         headers=TENANT_A,
     )
     assert resp.status_code == 409
@@ -122,7 +160,113 @@ def test_reserve_stock_insufficient_quantity(client, fake_db):
 def test_reserve_stock_missing_item(client, fake_db):
     resp = client.post(
         "/items/reserve",
-        json={"sku": "NOPE", "warehouse_id": "w1", "quantity": 1, "order_id": "order-1"},
+        json={
+            "sku": "NOPE",
+            "warehouse_id": "w1",
+            "quantity": 1,
+            "order_id": "order-1",
+        },
         headers=TENANT_A,
     )
     assert resp.status_code == 404
+
+
+def test_get_stock_same_sku_in_two_warehouses_is_cached_per_warehouse(client, fake_db):
+    """One tenant holds WIDGET in w1 and w2 with different quantities; reading
+    w1 first must not make the w2 read return w1's cached quantity."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=42, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=7, tenant_id="tenant-a")
+    first = client.get(
+        "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A
+    )
+    second = client.get(
+        "/items/WIDGET/stock", params={"warehouse_id": "w2"}, headers=TENANT_A
+    )
+    assert first.json()["quantity"] == 42
+    assert second.status_code == 200
+    assert second.json()["quantity"] == 7
+
+
+def test_get_stock_same_sku_for_two_tenants_is_cached_per_tenant(client, fake_db):
+    """Two tenants hold WIDGET in a warehouse with the same id; tenant A's
+    cached read must not be served to tenant B."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=42, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=3, tenant_id="tenant-b")
+    first = client.get(
+        "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A
+    )
+    second = client.get(
+        "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_B
+    )
+    assert first.json()["quantity"] == 42
+    assert second.status_code == 200
+    assert second.json()["quantity"] == 3
+
+
+def test_get_stock_cached_for_other_tenant_is_not_served_when_missing(client, fake_db):
+    """Only tenant A has WIDGET; after A's read is cached, tenant B still gets 404."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=42, tenant_id="tenant-a")
+    client.get("/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_A)
+    resp = client.get(
+        "/items/WIDGET/stock", params={"warehouse_id": "w1"}, headers=TENANT_B
+    )
+    assert resp.status_code == 404
+
+
+def test_reserve_stock_is_reflected_on_next_stock_read(client, fake_db):
+    """WIDGET sits in w1 and w2 for one tenant with both reads cached; a
+    reservation in w1 shows on the next w1 read and w2 keeps its own quantity."""
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=10, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=4, tenant_id="tenant-a")
+    w1, w2 = {"warehouse_id": "w1"}, {"warehouse_id": "w2"}
+    assert (
+        client.get("/items/WIDGET/stock", params=w1, headers=TENANT_A).json()[
+            "quantity"
+        ]
+        == 10
+    )
+    assert (
+        client.get("/items/WIDGET/stock", params=w2, headers=TENANT_A).json()[
+            "quantity"
+        ]
+        == 4
+    )
+    resp = client.post(
+        "/items/reserve",
+        json={
+            "sku": "WIDGET",
+            "warehouse_id": "w1",
+            "quantity": 3,
+            "order_id": "order-1",
+        },
+        headers=TENANT_A,
+    )
+    assert resp.status_code == 200
+    assert (
+        client.get("/items/WIDGET/stock", params=w1, headers=TENANT_A).json()[
+            "quantity"
+        ]
+        == 7
+    )
+    assert (
+        client.get("/items/WIDGET/stock", params=w2, headers=TENANT_A).json()[
+            "quantity"
+        ]
+        == 4
+    )
+
+
+def test_get_stock_ids_containing_colons_do_not_share_a_cache_entry(client, fake_db):
+    """Tenant "a:b" with SKU "c" and tenant "a" with SKU "b:c" in the same
+    warehouse would collide under a plain ':'-joined key; tenant "a" also holds
+    SKU "c". Each read must return that tenant's own quantity."""
+    fake_db.add_item(sku="c", warehouse_id="w1", quantity=11, tenant_id="a:b")
+    fake_db.add_item(sku="b:c", warehouse_id="w1", quantity=22, tenant_id="a")
+    fake_db.add_item(sku="c", warehouse_id="w1", quantity=33, tenant_id="a")
+    params = {"warehouse_id": "w1"}
+    first = client.get("/items/c/stock", params=params, headers={"X-Tenant-Id": "a:b"})
+    second = client.get("/items/b:c/stock", params=params, headers={"X-Tenant-Id": "a"})
+    third = client.get("/items/c/stock", params=params, headers={"X-Tenant-Id": "a"})
+    assert first.json()["quantity"] == 11
+    assert second.json()["quantity"] == 22
+    assert third.json()["quantity"] == 33
