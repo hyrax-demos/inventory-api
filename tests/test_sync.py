@@ -1,5 +1,7 @@
 import os
 
+from app.routes import items as items_routes
+
 TENANT_A = {"X-Tenant-Id": "tenant-a", "X-Admin-Token": os.environ["ADMIN_TOKEN"]}
 
 
@@ -125,3 +127,28 @@ def test_release_reservation_refreshes_only_its_own_warehouse(client, fake_db):
         ]
         == 2
     )
+
+
+def test_release_reservation_uses_the_tenant_get_stock_derives(
+    client, fake_db, monkeypatch
+):
+    """The header is sent as "Tenant-A" while _tenant lowercases it; the
+    release must act on and invalidate the key for "tenant-a", the tenant
+    get_stock reads under."""
+    monkeypatch.setattr(items_routes, "_tenant", lambda value: value.lower())
+    headers = {"X-Tenant-Id": "Tenant-A"}
+    params = {"warehouse_id": "w1"}
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    resp = client.get("/items/WIDGET/stock", params=params, headers=headers)
+    assert resp.json()["quantity"] == 5
+    resp = client.post("/reservations/order-1/release", headers=headers)
+    assert resp.status_code == 200
+    resp = client.get("/items/WIDGET/stock", params=params, headers=headers)
+    assert resp.json()["quantity"] == 8

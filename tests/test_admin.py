@@ -1,5 +1,7 @@
 import os
 
+from app.routes import items as items_routes
+
 TENANT_A = {"X-Tenant-Id": "tenant-a", "X-Admin-Token": os.environ["ADMIN_TOKEN"]}
 
 
@@ -84,3 +86,22 @@ def test_bulk_adjust_reflected_on_next_stock_read_in_every_warehouse(client, fak
     for wh, qty in (("w1", 6), ("w2", 7)):
         resp = client.get("/items/A/stock", params={"warehouse_id": wh}, headers=tenant)
         assert resp.json()["quantity"] == qty
+
+
+def test_bulk_adjust_uses_the_tenant_get_stock_derives(client, fake_db, monkeypatch):
+    """The header is sent as "Tenant-A" while _tenant lowercases it; bulk-adjust
+    must update and invalidate the entries for "tenant-a", the tenant get_stock
+    reads under."""
+    monkeypatch.setattr(items_routes, "_tenant", lambda value: value.lower())
+    tenant = {"X-Tenant-Id": "Tenant-A"}
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    resp = client.get("/items/A/stock", params={"warehouse_id": "w1"}, headers=tenant)
+    assert resp.json()["quantity"] == 1
+    resp = client.post(
+        "/admin/items/bulk-adjust",
+        json=[{"sku": "A", "delta": 5}],
+        headers={**tenant, "X-Admin-Token": os.environ["ADMIN_TOKEN"]},
+    )
+    assert resp.status_code == 200
+    resp = client.get("/items/A/stock", params={"warehouse_id": "w1"}, headers=tenant)
+    assert resp.json()["quantity"] == 6
