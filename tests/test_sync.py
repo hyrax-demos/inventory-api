@@ -10,7 +10,9 @@ def test_sync_prices_requires_admin_token(client, fake_db):
 
 
 def test_sync_single_item_happy_path(client, fake_db):
-    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=1, price=1.0, tenant_id="tenant-a")
+    fake_db.add_item(
+        sku="WIDGET", warehouse_id="w1", quantity=1, price=1.0, tenant_id="tenant-a"
+    )
     resp = client.post(
         "/sync/item/WIDGET",
         params={"warehouse_id": "w1", "price": 9.99},
@@ -31,13 +33,57 @@ def test_sync_single_item_not_found(client, fake_db):
 
 def test_release_reservation_happy_path(client, fake_db):
     fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
-    fake_db.add_reservation(order_id="order-1", tenant_id="tenant-a", sku="WIDGET", warehouse_id="w1", quantity=3)
-    resp = client.post("/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"})
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    resp = client.post(
+        "/reservations/order-1/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
     assert resp.status_code == 200
     assert resp.json()["released"] == 3
     assert fake_db.items[0]["quantity"] == 8
 
 
 def test_release_reservation_not_found(client, fake_db):
-    resp = client.post("/reservations/does-not-exist/release", headers={"X-Tenant-Id": "tenant-a"})
+    resp = client.post(
+        "/reservations/does-not-exist/release", headers={"X-Tenant-Id": "tenant-a"}
+    )
     assert resp.status_code == 404
+
+
+def test_release_reservation_is_reflected_on_next_stock_read(client, fake_db):
+    """WIDGET sits in w1 and w2 for one tenant with both reads cached; releasing
+    a w1 reservation shows on the next w1 read and w2 keeps its own quantity."""
+    headers = {"X-Tenant-Id": "tenant-a"}
+    w1, w2 = {"warehouse_id": "w1"}, {"warehouse_id": "w2"}
+    fake_db.add_item(sku="WIDGET", warehouse_id="w1", quantity=5, tenant_id="tenant-a")
+    fake_db.add_item(sku="WIDGET", warehouse_id="w2", quantity=2, tenant_id="tenant-a")
+    fake_db.add_reservation(
+        order_id="order-1",
+        tenant_id="tenant-a",
+        sku="WIDGET",
+        warehouse_id="w1",
+        quantity=3,
+    )
+    assert (
+        client.get("/items/WIDGET/stock", params=w1, headers=headers).json()["quantity"]
+        == 5
+    )
+    assert (
+        client.get("/items/WIDGET/stock", params=w2, headers=headers).json()["quantity"]
+        == 2
+    )
+    resp = client.post("/reservations/order-1/release", headers=headers)
+    assert resp.status_code == 200
+    assert (
+        client.get("/items/WIDGET/stock", params=w1, headers=headers).json()["quantity"]
+        == 8
+    )
+    assert (
+        client.get("/items/WIDGET/stock", params=w2, headers=headers).json()["quantity"]
+        == 2
+    )
