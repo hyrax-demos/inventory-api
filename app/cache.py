@@ -39,7 +39,10 @@ def invalidate(key: str) -> None:
 
 def invalidate_prefix(prefix: str) -> None:
     """Drop every entry whose key starts with ``prefix``."""
-    for key in [k for k in _store if k.startswith(prefix)]:
+    # Sync endpoints run on threadpool threads, so another request may put()
+    # while we scan. Snapshot the keys first (list() copies them in one C call)
+    # rather than iterating the live dict, which raises if it changes size.
+    for key in [k for k in list(_store) if k.startswith(prefix)]:
         _store.pop(key, None)
 
 

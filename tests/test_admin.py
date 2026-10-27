@@ -86,3 +86,28 @@ def test_bulk_adjust_is_reflected_on_next_stock_read_in_every_warehouse(
     for wh, qty in (("w1", 6), ("w2", 9)):
         resp = client.get("/items/A/stock", params={"warehouse_id": wh}, headers=tenant)
         assert resp.json()["quantity"] == qty
+
+
+def test_bulk_adjust_survives_a_cache_put_during_its_scan(client, fake_db):
+    """Another request's cache put lands while bulk adjust scans the cache for
+    the SKU's entries. A str key whose startswith() does that put stands in for
+    the other thread deterministically; the adjust must still succeed and drop
+    the SKU's cached reads."""
+    from app import cache
+
+    class _PutsDuringScan(str):
+        def startswith(self, *args):
+            cache.put(cache.stock_key("tenant-a", "w9", "OTHER"), {"quantity": 0})
+            return str.startswith(self, *args)
+
+    fake_db.add_item(sku="A", warehouse_id="w1", quantity=1, tenant_id="tenant-a")
+    tenant = {"X-Tenant-Id": "tenant-a"}
+    resp = client.get("/items/A/stock", params={"warehouse_id": "w1"}, headers=tenant)
+    assert resp.json()["quantity"] == 1
+    cache.put(_PutsDuringScan("price:w1:B"), 1.0)
+    resp = client.post(
+        "/admin/items/bulk-adjust", json=[{"sku": "A", "delta": 5}], headers=TENANT_A
+    )
+    assert resp.status_code == 200
+    resp = client.get("/items/A/stock", params={"warehouse_id": "w1"}, headers=tenant)
+    assert resp.json()["quantity"] == 6
